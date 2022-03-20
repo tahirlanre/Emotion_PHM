@@ -29,7 +29,7 @@ from transformers import (
     get_scheduler,
 )
 
-from utils.train import init_logger, set_seed, compute_metrics
+from utils import init_logger, set_seed, compute_metrics
 
 import wandb
 
