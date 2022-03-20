@@ -30,7 +30,7 @@ from transformers import (
 )
 
 from model import BertMLP
-from utils.train import init_logger, set_seed, compute_metrics
+from utils.utils import init_logger, set_seed, compute_metrics
 
 logger = logging.getLogger(__name__)
 
