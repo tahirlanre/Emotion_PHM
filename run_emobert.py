@@ -29,7 +29,7 @@ from transformers import (
     get_scheduler,
 )
 
-from model import BertMLP
+from models.model import BertMLP
 from utils.utils import init_logger, set_seed, compute_metrics
 
 logger = logging.getLogger(__name__)
