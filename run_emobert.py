@@ -191,7 +191,9 @@ def main():
         from_tf=bool(".ckpt" in args.model_name_or_path),
         config=config,
     )
-    emobert_model = AutoModel.from_pretrained(args.emotion_model_name_or_path)
+    emobert_model = AutoModel.from_pretrained(
+        "monologg/bert-base-cased-goemotions-ekman"
+    )
 
     special_tokens_dict = {"additional_special_tokens": ["<url>", "<user>"]}
     tokenizer.add_special_tokens(special_tokens_dict)
