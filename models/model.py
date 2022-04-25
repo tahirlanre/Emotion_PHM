@@ -81,3 +81,44 @@ class AttnGating(nn.Module):
         embedding_output = self.dropout(self.LayerNorm(E))
 
         return E
+
+
+class BertClassificationModel(nn.Module):
+    def __init__(self, model_name_or_path, num_labels):
+        super(BertClassificationModel, self).__init__()
+
+        self.roberta = AutoModel.from_pretrained(
+            model_name_or_path, add_pooling_layer=False, return_dict=True
+        )
+
+        self.dropout = nn.Dropout(0.1)
+        self.num_labels = num_labels
+
+        self.classifier = nn.Linear(768, num_labels)
+
+        self.beta = 0.1
+
+    def forward(self, embedding_output, attention_mask, labels=None):
+        outputs = self.roberta(
+            input_ids=None,
+            inputs_embeds=embedding_output,
+            attention_mask=attention_mask,
+        )
+        sequence_output = outputs.last_hidden_state
+
+        x = sequence_output[:, 0, :]
+        x = self.dropout(x)
+        x = torch.tanh(x)
+        x = self.dropout(x)
+
+        logits = self.classifier(x)
+        loss = None
+
+        # Training on binary complaint
+        if labels is not None:
+            loss_fn = nn.CrossEntropyLoss()
+            loss = loss_fn(logits.view(-1, self.num_labels), labels.view(-1))
+
+        output = (logits,) + outputs[2:]
+
+        return ((loss,) + output) if loss is not None else output
