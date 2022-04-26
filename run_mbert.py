@@ -29,7 +29,7 @@ from transformers import (
     get_scheduler,
 )
 
-from models.model import BertMLP, AttnGating, BertClassificationModel
+from models.model import AttnGating, BertClassificationModel
 from utils.utils import init_logger, set_seed, compute_metrics
 
 logger = logging.getLogger(__name__)
@@ -77,12 +77,12 @@ def parse_args():
         help="Path to pretrained model or model identifier from huggingface.co/models.",
         required=True,
     )
-    # parser.add_argument(
-    #     "--emotion_model_name_or_path",
-    #     type=str,
-    #     help="Path to pretrained model on emotion representatons.",
-    #     required=True,
-    # )
+    parser.add_argument(
+        "--emotion_model_name_or_path",
+        type=str,
+        help="Path to pretrained model on emotion representatons.",
+        required=True,
+    )
     parser.add_argument(
         "--per_device_train_batch_size",
         type=int,
@@ -197,23 +197,19 @@ def main():
     for seed in random_seeds:
         set_seed(seed)
 
-        raw_dataset = Dataset.load_from_disk(args.train_file)
-        train_devtest = raw_dataset.train_test_split(
-            shuffle=True, seed=42, test_size=0.1
-        )
-        dev_test = train_devtest["test"].train_test_split(
-            shuffle=True, seed=42, test_size=0.5
-        )
+        data_files = {}
+        if args.train_file is not None:
+            data_files["train"] = args.train_file
+        if args.validation_file is not None:
+            data_files["validation"] = args.validation_file
+        if args.test_file is not None:
+            data_files["test"] = args.test_file
+        extension = (
+            args.train_file if args.train_file is not None else args.valid_file
+        ).split(".")[-1]
+        raw_datasets = load_dataset(extension, data_files=data_files)
 
-        dataset = DatasetDict(
-            {
-                "train": train_devtest["train"],
-                "validation": dev_test["train"],
-                "test": dev_test["test"],
-            }
-        )
-
-        label_list = dataset["train"].unique("label")
+        label_list = raw_datasets["train"].unique("label")
         label_list.sort()
         label_to_id = {v: i for i, v in enumerate(label_list)}
         num_labels = len(label_list)
@@ -231,7 +227,12 @@ def main():
         )
         embedding_bert_model.to(device)
 
-        attn_gate = AttnGating(200, 768, 0.5)
+        emotion_bert_model = AutoModel.from_pretrained(
+            args.emotion_model_name_or_path, output_hidden_states=True
+        )
+        emotion_bert_model.to(device)
+
+        attn_gate = AttnGating(768, 0.5)
         attn_gate.to(device)
 
         padding = "max_length" if args.pad_to_max_length else False
@@ -250,16 +251,16 @@ def main():
                     # In all cases, rename the column to labels because the model will expect that.
                     result["labels"] = examples["label"]
 
-            result["emo_features"] = [
-                torch.tensor(feature) for feature in examples["emo_features"]
-            ]
+            # result["emo_features"] = [
+            #     torch.tensor(feature) for feature in examples["emo_features"]
+            # ]
 
             return result
 
-        processed_datasets = dataset.map(
+        processed_datasets = raw_datasets.map(
             preprocess_function,
             batched=True,
-            remove_columns=dataset["train"].column_names,
+            remove_columns=raw_datasets["train"].column_names,
             desc="Running tokenizer on dataset",
         )
 
@@ -364,7 +365,9 @@ def main():
                 batch.to(device)
                 embedding_outputs = embedding_bert_model(batch["input_ids"])
                 bert_embed = embedding_outputs.hidden_states[0]
-                combine_embed = attn_gate(bert_embed, batch["emo_features"])
+                emo_embedding_outputs = emotion_bert_model(batch["input_ids"])
+                emotion_bert_embed = emo_embedding_outputs.hidden_states[0]
+                combine_embed = attn_gate(bert_embed, emotion_bert_embed)
                 outputs = model_bert(
                     embedding_output=combine_embed,
                     attention_mask=batch["attention_mask"],
@@ -430,7 +433,9 @@ def main():
                 batch.to(device)
                 embedding_outputs = embedding_bert_model(batch["input_ids"])
                 bert_embed = embedding_outputs.hidden_states[0]
-                combine_embed = attn_gate(bert_embed, batch["emo_features"])
+                emo_embedding_outputs = emotion_bert_model(batch["input_ids"])
+                emotion_bert_embed = emo_embedding_outputs.hidden_states[0]
+                combine_embed = attn_gate(bert_embed, emotion_bert_embed)
                 outputs = model_bert(
                     embedding_output=combine_embed,
                     attention_mask=batch["attention_mask"],
@@ -495,7 +500,9 @@ def main():
                 batch.to(device)
                 embedding_outputs = embedding_bert_model(batch["input_ids"])
                 bert_embed = embedding_outputs.hidden_states[0]
-                combine_embed = attn_gate(bert_embed, batch["emo_features"])
+                emo_embedding_outputs = emotion_bert_model(batch["input_ids"])
+                emotion_bert_embed = emo_embedding_outputs.hidden_states[0]
+                combine_embed = attn_gate(bert_embed, emotion_bert_embed)
                 outputs = best_model(
                     embedding_output=combine_embed,
                     attention_mask=batch["attention_mask"],
