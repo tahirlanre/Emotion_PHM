@@ -20,17 +20,17 @@ from torch.utils.data import DataLoader
 import transformers
 from transformers import (
     AdamW,
-    AutoConfig,
     AutoTokenizer,
     AutoModel,
     SchedulerType,
     DataCollatorWithPadding,
     default_data_collator,
-    get_scheduler,
 )
+import transformers.optimization as tfoptim
 
-from models.model import AttnGating, BertClassificationModel
+from models.model import AttnGating, BertClassificationModel, BiLSTMAttn, BiLSTM
 from utils.utils import init_logger, set_seed, compute_metrics
+from const import SEEDS
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +82,13 @@ def parse_args():
         type=str,
         help="Path to pretrained model on emotion representatons.",
         required=True,
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        choices=["mbert", "bisltm_attn", "bilstm"],
+        required=True,
+        help="the name of the model to use. some models may use different model args than others.",
     )
     parser.add_argument(
         "--per_device_train_batch_size",
@@ -154,9 +161,35 @@ def parse_args():
         default=100,
         help="Number of updates steps before logging metrics",
     )
+    parser.add_argument(
+        "--hidden_dim",
+        type=int,
+        default=512,
+        help="size of the model's hidden layer. ignored for BERT.",
+    )
+    parser.add_argument(
+        "--num_layers", type=int, default=1, help="number of lstm layers to use."
+    )
+    parser.add_argument(
+        "--dropout",
+        type=float,
+        default=0.1,
+        help="dropout to apply to the model during training",
+    )
+    parser.add_argument(
+        "--num_restarts",
+        type=int,
+        default=1,
+        help="the number of random restarts to average. we have 10 random seeds predefined in const.py; more "
+        "restarts than this will cause an error unless you add more seeds.",
+    )
     args = parser.parse_args()
 
     return args
+
+
+def train():
+    pass
 
 
 def main():
@@ -166,6 +199,8 @@ def main():
 
     datasets.utils.logging.set_verbosity_error()
     transformers.utils.logging.set_verbosity_error()
+
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
 
     wandb.login()
     wandb.init(project="phm-classification")
@@ -181,20 +216,9 @@ def main():
         output_dir = os.path.join("runs", run_name)
         os.makedirs(output_dir, exist_ok=True)
 
-    random_seeds = [
-        69556,
-        79719,
-        30010,
-        46921,
-        25577,
-        52538,
-        56440,
-        41228,
-        66558,
-        48642,
-    ]
     best_result, best_val = {}, []
-    for seed in random_seeds:
+    for i in range(args.num_restarts):
+        seed = SEEDS[i]
         set_seed(seed)
 
         data_files = {}
@@ -217,11 +241,6 @@ def main():
         # config = AutoConfig.from_pretrained(args.model_name_or_path, num_labels=num_labels)
         tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
 
-        device = "cuda:0" if torch.cuda.is_available() else "cpu"
-
-        model_bert = BertClassificationModel(args.model_name_or_path, num_labels)
-        model_bert.to(device)
-
         embedding_bert_model = AutoModel.from_pretrained(
             args.model_name_or_path, output_hidden_states=True
         )
@@ -232,8 +251,30 @@ def main():
         )
         emotion_bert_model.to(device)
 
-        attn_gate = AttnGating(768, 0.5)
-        attn_gate.to(device)
+        if args.model == "bert":
+            model = BertClassificationModel(args.model_name_or_path, num_labels)
+            attn_gate = AttnGating(
+                embedding_bert_model.config.hidden_size, args.dropout
+            )
+            attn_gate.to(device)
+        elif args.model == "bilstm":
+            model = BiLSTM(
+                embedding_bert_model.config.hidden_size,
+                args.hidden_dim,
+                args.num_layers,
+                num_labels,
+                args.dropout,
+            )
+        elif args.model == "bilstm_attn":
+            model = BiLSTMAttn(
+                embedding_bert_model.config.hidden_size,
+                args.hidden_dim,
+                args.num_layers,
+                num_labels,
+                args.dropout,
+            )
+
+        model.to(device)
 
         padding = "max_length" if args.pad_to_max_length else False
 
@@ -250,11 +291,6 @@ def main():
                 else:
                     # In all cases, rename the column to labels because the model will expect that.
                     result["labels"] = examples["label"]
-
-            # result["emo_features"] = [
-            #     torch.tensor(feature) for feature in examples["emo_features"]
-            # ]
-
             return result
 
         processed_datasets = raw_datasets.map(
@@ -300,39 +336,19 @@ def main():
             batch_size=args.per_device_eval_batch_size,
         )
 
-        # Optimizer
-        # Split weights in two groups, one with weight decay and the other not.
-        no_decay = ["bias", "LayerNorm.weight"]
-        optimizer_grouped_parameters = [
-            {
-                "params": [
-                    p
-                    for n, p in model_bert.named_parameters()
-                    if not any(nd in n for nd in no_decay)
-                ],
-                "weight_decay": args.weight_decay,
-            },
-            {
-                "params": [
-                    p
-                    for n, p in model_bert.named_parameters()
-                    if any(nd in n for nd in no_decay)
-                ],
-                "weight_decay": 0.0,
-            },
-        ]
-        optimizer = AdamW(optimizer_grouped_parameters, lr=args.learning_rate)
+        # create optimizer
+        optimizer = AdamW(model.parameters(), lr=args.learning_rate)
 
         num_update_steps_per_epoch = math.ceil(
             len(train_dataloader) / args.gradient_accumulation_steps
         )
         max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
 
-        lr_scheduler = get_scheduler(
-            name=args.lr_scheduler_type,
-            optimizer=optimizer,
-            num_warmup_steps=args.num_warmup_steps,
-            num_training_steps=max_train_steps,
+        # create scheduler for optimizer
+        lr_scheduler = tfoptim.get_linear_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=int((len(train_dataloader) * args.num_train_epochs) / 10),
+            num_training_steps=len(train_dataloader) * args.num_train_epochs,
         )
 
         total_batch_size = (
@@ -360,19 +376,24 @@ def main():
 
         train_loss = 0.0
         for epoch in range(args.num_train_epochs):
-            model_bert.train()
+            model.train()
             for step, batch in enumerate(train_dataloader):
                 batch.to(device)
                 embedding_outputs = embedding_bert_model(batch["input_ids"])
                 bert_embed = embedding_outputs.hidden_states[0]
                 emo_embedding_outputs = emotion_bert_model(batch["input_ids"])
                 emotion_bert_embed = emo_embedding_outputs.hidden_states[0]
-                combine_embed = attn_gate(bert_embed, emotion_bert_embed)
-                outputs = model_bert(
-                    embedding_output=combine_embed,
-                    attention_mask=batch["attention_mask"],
-                    labels=batch["labels"],
-                )
+                if args.model == "bert":
+                    combine_embed = attn_gate(bert_embed, emotion_bert_embed)
+                    outputs = model(
+                        embedding_output=combine_embed,
+                        attention_mask=batch["attention_mask"],
+                        labels=batch["labels"],
+                    )
+                else:
+                    combine_embed = torch.cat((bert_embed, emotion_bert_embed), axis=-1)
+                    outputs = model(combine_embed, batch["labels"])
+
                 loss = outputs[0]
                 loss = loss / args.gradient_accumulation_steps
                 train_loss += loss.item()
@@ -387,33 +408,6 @@ def main():
                     progress_bar.update(1)
                     global_step += 1
 
-                if args.save_steps > 0 and global_step % args.save_steps == 0:
-                    if args.output_dir is not None:
-                        # delete older checkpoint(s)
-                        glob_checkpoints = [
-                            str(x) for x in Path(output_dir).glob(f"checkpoint-*")
-                        ]
-
-                        for checkpoint in glob_checkpoints:
-                            logger.info(f"Deleting older checkpoint {checkpoint}")
-                            shutil.rmtree(checkpoint)
-
-                        # Save model checkpoint
-                        ckpt_output_dir = os.path.join(
-                            output_dir, f"checkpoint-{global_step}"
-                        )
-                        os.makedirs(ckpt_output_dir, exist_ok=True)
-
-                        logger.info(f"Saving model checkpoint to {ckpt_output_dir}")
-
-                        model_to_save = (
-                            model_bert.module
-                            if hasattr(model_bert, "module")
-                            else model_bert
-                        )
-                        model_to_save.save_pretrained(ckpt_output_dir)
-                        tokenizer.save_pretrained(ckpt_output_dir)
-
                 # log interval loss
                 if global_step % args.log_interval == 0:
                     cur_loss = train_loss / args.log_interval
@@ -424,7 +418,7 @@ def main():
                 # if global_step >= args.max_train_steps:
                 #     break
 
-            model_bert.eval()
+            model.eval()
             eval_loss = 0.0
             y_pred = None
             y_true = None
@@ -435,12 +429,16 @@ def main():
                 bert_embed = embedding_outputs.hidden_states[0]
                 emo_embedding_outputs = emotion_bert_model(batch["input_ids"])
                 emotion_bert_embed = emo_embedding_outputs.hidden_states[0]
-                combine_embed = attn_gate(bert_embed, emotion_bert_embed)
-                outputs = model_bert(
-                    embedding_output=combine_embed,
-                    attention_mask=batch["attention_mask"],
-                    labels=batch["labels"],
-                )
+                if args.model == "bert":
+                    combine_embed = attn_gate(bert_embed, emotion_bert_embed)
+                    outputs = model(
+                        embedding_output=combine_embed,
+                        attention_mask=batch["attention_mask"],
+                        labels=batch["labels"],
+                    )
+                else:
+                    combine_embed = torch.cat((bert_embed, emotion_bert_embed), axis=-1)
+                    outputs = model(combine_embed, batch["labels"])
                 eval_loss += outputs[0].item()
                 if y_pred is None:
                     y_pred = outputs[1].argmax(dim=-1).detach().cpu().numpy()
@@ -480,16 +478,12 @@ def main():
             if eval_loss < best_val_loss:
                 if args.output_dir is not None:
                     logger.info(f"Saving best model to {output_dir}")
-                    model_to_save = (
-                        model_bert.module
-                        if hasattr(model_bert, "module")
-                        else model_bert
-                    )
+                    model_to_save = model.module if hasattr(model, "module") else model
                     model_to_save.save_pretrained(output_dir)
                     tokenizer.save_pretrained(output_dir)
                     best_val_loss = eval_loss
                 else:
-                    best_model = copy.deepcopy(model_bert)
+                    best_model = copy.deepcopy(model)
                     best_val_loss = eval_loss
 
         y_pred = None
@@ -502,12 +496,16 @@ def main():
                 bert_embed = embedding_outputs.hidden_states[0]
                 emo_embedding_outputs = emotion_bert_model(batch["input_ids"])
                 emotion_bert_embed = emo_embedding_outputs.hidden_states[0]
-                combine_embed = attn_gate(bert_embed, emotion_bert_embed)
-                outputs = best_model(
-                    embedding_output=combine_embed,
-                    attention_mask=batch["attention_mask"],
-                    labels=batch["labels"],
-                )
+                if args.model == "bert":
+                    combine_embed = attn_gate(bert_embed, emotion_bert_embed)
+                    outputs = model(
+                        embedding_output=combine_embed,
+                        attention_mask=batch["attention_mask"],
+                        labels=batch["labels"],
+                    )
+                else:
+                    combine_embed = torch.cat((bert_embed, emotion_bert_embed), axis=-1)
+                    outputs = model(combine_embed, batch["labels"])
 
                 if y_pred is None:
                     y_pred = outputs[1].argmax(dim=-1).detach().cpu().numpy()
