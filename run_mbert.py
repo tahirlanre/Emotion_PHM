@@ -251,12 +251,11 @@ def main():
         )
         emotion_bert_model.to(device)
 
+        attn_gate = AttnGating(embedding_bert_model.config.hidden_size, args.dropout)
+        attn_gate.to(device)
+
         if args.model == "bert":
             model = BertClassificationModel(args.model_name_or_path, num_labels)
-            attn_gate = AttnGating(
-                embedding_bert_model.config.hidden_size, args.dropout
-            )
-            attn_gate.to(device)
         elif args.model == "bilstm":
             model = BiLSTM(
                 embedding_bert_model.config.hidden_size,
@@ -355,7 +354,9 @@ def main():
             args.per_device_train_batch_size * args.gradient_accumulation_steps
         )
 
-        logger.info(f"***** Running training with seed = {seed} *****")
+        logger.info(
+            f"***** Running training {i} of {args.num_restarts} with seed = {seed} *****"
+        )
         logger.info(f"  Num examples = {len(train_dataset)}")
         logger.info(f"  Num Epochs = {args.num_train_epochs}")
         logger.info(
@@ -383,15 +384,15 @@ def main():
                 bert_embed = embedding_outputs.hidden_states[0]
                 emo_embedding_outputs = emotion_bert_model(batch["input_ids"])
                 emotion_bert_embed = emo_embedding_outputs.hidden_states[0]
+                combine_embed = attn_gate(bert_embed, emotion_bert_embed)
+
                 if args.model == "bert":
-                    combine_embed = attn_gate(bert_embed, emotion_bert_embed)
                     outputs = model(
                         embedding_output=combine_embed,
                         attention_mask=batch["attention_mask"],
                         labels=batch["labels"],
                     )
                 else:
-                    combine_embed = torch.cat((bert_embed, emotion_bert_embed), axis=-1)
                     outputs = model(combine_embed, batch["labels"])
 
                 loss = outputs[0]
@@ -429,16 +430,17 @@ def main():
                 bert_embed = embedding_outputs.hidden_states[0]
                 emo_embedding_outputs = emotion_bert_model(batch["input_ids"])
                 emotion_bert_embed = emo_embedding_outputs.hidden_states[0]
+                combine_embed = attn_gate(bert_embed, emotion_bert_embed)
+
                 if args.model == "bert":
-                    combine_embed = attn_gate(bert_embed, emotion_bert_embed)
                     outputs = model(
                         embedding_output=combine_embed,
                         attention_mask=batch["attention_mask"],
                         labels=batch["labels"],
                     )
                 else:
-                    combine_embed = torch.cat((bert_embed, emotion_bert_embed), axis=-1)
                     outputs = model(combine_embed, batch["labels"])
+
                 eval_loss += outputs[0].item()
                 if y_pred is None:
                     y_pred = outputs[1].argmax(dim=-1).detach().cpu().numpy()
@@ -496,8 +498,9 @@ def main():
                 bert_embed = embedding_outputs.hidden_states[0]
                 emo_embedding_outputs = emotion_bert_model(batch["input_ids"])
                 emotion_bert_embed = emo_embedding_outputs.hidden_states[0]
+                combine_embed = attn_gate(bert_embed, emotion_bert_embed)
+
                 if args.model == "bert":
-                    combine_embed = attn_gate(bert_embed, emotion_bert_embed)
                     outputs = model(
                         embedding_output=combine_embed,
                         attention_mask=batch["attention_mask"],
@@ -537,7 +540,7 @@ def main():
 
         best_result[seed] = results
 
-    output_avg_test_file = os.path.join(output_dir, f"test_results.txt")
+    output_avg_test_file = os.path.join(output_dir, f"test_results-{args.model}.txt")
     logger.info(f"*****  Average eval results on test dataset *****")
     with open(output_avg_test_file, "w") as f_w:
         for key in sorted(results.keys()):
