@@ -28,7 +28,7 @@ from transformers import (
 )
 import transformers.optimization as tfoptim
 
-from models.model import AttnGating, BertClassificationModel, BiLSTMAttn, BiLSTM
+from models.model import BertClassificationModel, BiLSTMAttn, BiLSTM, MLP
 from utils.utils import init_logger, set_seed, compute_metrics
 from const import SEEDS
 
@@ -86,7 +86,7 @@ def parse_args():
     parser.add_argument(
         "--model",
         type=str,
-        choices=["mbert", "bisltm_attn", "bilstm"],
+        choices=["bert", "bilstm_attn", "bilstm", "mlp"],
         required=True,
         help="the name of the model to use. some models may use different model args than others.",
     )
@@ -241,24 +241,14 @@ def main():
         # config = AutoConfig.from_pretrained(args.model_name_or_path, num_labels=num_labels)
         tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
 
-        embedding_bert_model = AutoModel.from_pretrained(
-            args.model_name_or_path, output_hidden_states=True
-        )
-        embedding_bert_model.to(device)
-
-        emotion_bert_model = AutoModel.from_pretrained(
-            args.emotion_model_name_or_path, output_hidden_states=True
-        )
-        emotion_bert_model.to(device)
-
-        attn_gate = AttnGating(embedding_bert_model.config.hidden_size, args.dropout)
-        attn_gate.to(device)
-
         if args.model == "bert":
-            model = BertClassificationModel(args.model_name_or_path, num_labels)
+            model = BertClassificationModel(
+                args.model_name_or_path, args.emotion_model_name_or_path, num_labels
+            )
         elif args.model == "bilstm":
             model = BiLSTM(
-                embedding_bert_model.config.hidden_size,
+                args.model_name_or_path,
+                args.emotion_model_name_or_path,
                 args.hidden_dim,
                 args.num_layers,
                 num_labels,
@@ -266,9 +256,17 @@ def main():
             )
         elif args.model == "bilstm_attn":
             model = BiLSTMAttn(
-                embedding_bert_model.config.hidden_size,
+                args.model_name_or_path,
+                args.emotion_model_name_or_path,
                 args.hidden_dim,
                 args.num_layers,
+                num_labels,
+                args.dropout,
+            )
+        elif args.model == "mlp":
+            model = MLP(
+                args.model_name_or_path,
+                args.emotion_model_name_or_path,
                 num_labels,
                 args.dropout,
             )
@@ -380,20 +378,9 @@ def main():
             model.train()
             for step, batch in enumerate(train_dataloader):
                 batch.to(device)
-                embedding_outputs = embedding_bert_model(batch["input_ids"])
-                bert_embed = embedding_outputs.hidden_states[0]
-                emo_embedding_outputs = emotion_bert_model(batch["input_ids"])
-                emotion_bert_embed = emo_embedding_outputs.hidden_states[0]
-                combine_embed = attn_gate(bert_embed, emotion_bert_embed)
-
-                if args.model == "bert":
-                    outputs = model(
-                        embedding_output=combine_embed,
-                        attention_mask=batch["attention_mask"],
-                        labels=batch["labels"],
-                    )
-                else:
-                    outputs = model(combine_embed, batch["labels"])
+                outputs = model(
+                    batch["input_ids"], batch["attention_mask"], batch["labels"]
+                )
 
                 loss = outputs[0]
                 loss = loss / args.gradient_accumulation_steps
@@ -426,20 +413,9 @@ def main():
 
             for step, batch in enumerate(eval_dataloader):
                 batch.to(device)
-                embedding_outputs = embedding_bert_model(batch["input_ids"])
-                bert_embed = embedding_outputs.hidden_states[0]
-                emo_embedding_outputs = emotion_bert_model(batch["input_ids"])
-                emotion_bert_embed = emo_embedding_outputs.hidden_states[0]
-                combine_embed = attn_gate(bert_embed, emotion_bert_embed)
-
-                if args.model == "bert":
-                    outputs = model(
-                        embedding_output=combine_embed,
-                        attention_mask=batch["attention_mask"],
-                        labels=batch["labels"],
-                    )
-                else:
-                    outputs = model(combine_embed, batch["labels"])
+                outputs = model(
+                    batch["input_ids"], batch["attention_mask"], batch["labels"]
+                )
 
                 eval_loss += outputs[0].item()
                 if y_pred is None:
@@ -494,21 +470,9 @@ def main():
         with torch.no_grad():
             for step, batch in enumerate(test_dataloader):
                 batch.to(device)
-                embedding_outputs = embedding_bert_model(batch["input_ids"])
-                bert_embed = embedding_outputs.hidden_states[0]
-                emo_embedding_outputs = emotion_bert_model(batch["input_ids"])
-                emotion_bert_embed = emo_embedding_outputs.hidden_states[0]
-                combine_embed = attn_gate(bert_embed, emotion_bert_embed)
-
-                if args.model == "bert":
-                    outputs = model(
-                        embedding_output=combine_embed,
-                        attention_mask=batch["attention_mask"],
-                        labels=batch["labels"],
-                    )
-                else:
-                    combine_embed = torch.cat((bert_embed, emotion_bert_embed), axis=-1)
-                    outputs = model(combine_embed, batch["labels"])
+                outputs = model(
+                    batch["input_ids"], batch["attention_mask"], batch["labels"]
+                )
 
                 if y_pred is None:
                     y_pred = outputs[1].argmax(dim=-1).detach().cpu().numpy()

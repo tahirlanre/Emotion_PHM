@@ -41,35 +41,71 @@ class AttnGating(nn.Module):
         return E
 
 
-class BertClassificationModel(nn.Module):
-    def __init__(self, model_name_or_path, num_labels, dropout=0.1):
-        super(BertClassificationModel, self).__init__()
-
-        self.bert = AutoModel.from_pretrained(
-            model_name_or_path, add_pooling_layer=False, return_dict=True
+class WeightedLayerPooling(nn.Module):
+    def __init__(self, num_hidden_layers, layer_start: int = 4, layer_weights=None):
+        super(WeightedLayerPooling, self).__init__()
+        self.layer_start = layer_start
+        self.num_hidden_layers = num_hidden_layers
+        self.layer_weights = (
+            layer_weights
+            if layer_weights is not None
+            else nn.Parameter(
+                torch.tensor(
+                    [1] * (num_hidden_layers + 1 - layer_start), dtype=torch.float
+                )
+            )
         )
 
-        self.dropout = nn.Dropout(dropout)
+    def forward(self, all_hidden_states):
+        all_layer_embedding = all_hidden_states[self.layer_start :, :, :, :]
+        weight_factor = (
+            self.layer_weights.unsqueeze(-1)
+            .unsqueeze(-1)
+            .unsqueeze(-1)
+            .expand(all_layer_embedding.size())
+        )
+        weighted_average = (weight_factor * all_layer_embedding).sum(
+            dim=0
+        ) / self.layer_weights.sum()
+        return weighted_average
+
+
+class BertClassificationModel(nn.Module):
+    def __init__(
+        self, model_name_or_path, emo_model_name_or_path, num_labels, dropout=0.1
+    ):
+        super(BertClassificationModel, self).__init__()
+
+        self.bert = AutoModel.from_pretrained(model_name_or_path)
+        self.enc_model = AutoModel.from_pretrained(
+            model_name_or_path, output_hidden_states=True
+        )
+        self.emo_model = AutoModel.from_pretrained(
+            emo_model_name_or_path, output_hidden_states=True
+        )
+        self.attn_gate = AttnGating(self.enc_model.config.hidden_size, dropout)
         self.num_labels = num_labels
 
         self.classifier = nn.Linear(768, num_labels)
 
-    def forward(self, embedding_output, attention_mask, labels=None):
+    def forward(self, features, attn_mask=None, labels=None):
+        enc_outputs = self.enc_model(features, attention_mask=attn_mask)
+        embeds = enc_outputs.hidden_states[0]
+
+        emo_outputs = self.emo_model(features, attention_mask=attn_mask)
+        emo_embeds = enc_outputs.hidden_states[0]
+
+        combined_embeds = self.attn_gate(embeds, emo_embeds)
+
         outputs = self.bert(
             input_ids=None,
-            inputs_embeds=embedding_output,
-            attention_mask=attention_mask,
+            inputs_embeds=combined_embeds,
         )
-        sequence_output = outputs.last_hidden_state
+        pooled_output = outputs[1]
 
-        x = sequence_output[:, 0, :]
-        x = self.dropout(x)
-        x = torch.tanh(x)
-        x = self.dropout(x)
+        logits = self.classifier(pooled_output)
 
-        logits = self.classifier(x)
         loss = None
-
         if labels is not None:
             loss_fn = nn.CrossEntropyLoss()
             loss = loss_fn(logits.view(-1, self.num_labels), labels.view(-1))
@@ -80,20 +116,38 @@ class BertClassificationModel(nn.Module):
 
 
 class BiLSTMAttn(nn.Module):
-    def __init__(self, embedding_dim, hidden_dim, num_layers, num_labels, dropout=0.1):
+    def __init__(
+        self,
+        enc_model_name_or_path,
+        emo_model_name_or_path,
+        hidden_dim,
+        num_layers,
+        num_labels,
+        dropout=0.1,
+    ):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.n_layers = num_layers
         self.num_labels = num_labels
         self.dropout = nn.Dropout(dropout)
-        self.encoder = nn.LSTM(
-            embedding_dim,
+
+        self.enc_model = AutoModel.from_pretrained(
+            enc_model_name_or_path, output_hidden_states=True
+        )
+        self.emo_model = AutoModel.from_pretrained(
+            emo_model_name_or_path, output_hidden_states=True
+        )
+        self.attn_gate = AttnGating(self.enc_model.config.hidden_size, dropout)
+
+        self.bilstm = nn.LSTM(
+            self.enc_model.config.hidden_size,
             hidden_dim,
             dropout=dropout if num_layers > 1 else 0,
             num_layers=num_layers,
             batch_first=True,
             bidirectional=True,
         )
+
         self.classifier = nn.Linear(hidden_dim, num_labels)
 
     def attnetwork(self, encoder_out, final_hidden):
@@ -106,8 +160,16 @@ class BiLSTMAttn(nn.Module):
 
         return new_hidden
 
-    def forward(self, features, labels=None):
-        outputs, (hn, cn) = self.encoder(features)
+    def forward(self, features, attn_mask=None, labels=None):
+        enc_outputs = self.enc_model(features, attention_mask=attn_mask)
+        embeds = enc_outputs.hidden_states[0]
+
+        emo_outputs = self.emo_model(features, attention_mask=attn_mask)
+        emo_embeds = emo_outputs.hidden_states[0]
+
+        combined_embeds = self.attn_gate(embeds, emo_embeds)
+
+        outputs, (hn, cn) = self.bilstm(combined_embeds)
         fbout = outputs[:, :, : self.hidden_dim] + outputs[:, :, self.hidden_dim :]
         fbhn = (hn[-2, :, :] + hn[-1, :, :]).unsqueeze(0)
         fbhn = self.dropout(fbhn)
@@ -126,24 +188,50 @@ class BiLSTMAttn(nn.Module):
 
 
 class BiLSTM(nn.Module):
-    def __init__(self, embedding_dim, hidden_dim, num_layers, num_labels, dropout=0.1):
+    def __init__(
+        self,
+        enc_model_name_or_path,
+        emo_model_name_or_path,
+        hidden_dim,
+        num_layers,
+        num_labels,
+        dropout=0.1,
+    ):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.n_layers = num_layers
         self.num_labels = num_labels
         self.dropout = nn.Dropout(dropout)
-        self.encoder = nn.LSTM(
-            embedding_dim,
+
+        self.enc_model = AutoModel.from_pretrained(
+            enc_model_name_or_path, output_hidden_states=True
+        )
+        self.emo_model = AutoModel.from_pretrained(
+            emo_model_name_or_path, output_hidden_states=True
+        )
+        self.attn_gate = AttnGating(self.enc_model.config.hidden_size, dropout)
+
+        self.bilstm = nn.LSTM(
+            self.enc_model.config.hidden_size,
             hidden_dim,
             dropout=dropout if num_layers > 1 else 0,
             num_layers=num_layers,
             batch_first=True,
             bidirectional=True,
         )
+
         self.classifier = nn.Linear(hidden_dim * 2, num_labels)
 
-    def forward(self, features, labels=None):
-        outputs, (hn, cn) = self.encoder(features)
+    def forward(self, features, attn_mask=None, labels=None):
+        enc_outputs = self.enc_model(features, attention_mask=attn_mask)
+        embeds = enc_outputs.hidden_states[0]
+
+        emo_outputs = self.emo_model(features, attention_mask=attn_mask)
+        emo_embeds = emo_outputs.hidden_states[0]
+
+        combined_embeds = self.attn_gate(embeds, emo_embeds)
+
+        outputs, (hn, cn) = self.bilstm(combined_embeds)
         fbhn = torch.cat((hn[-2, :, :], hn[-1, :, :]), dim=1)
         fbhn = self.dropout(fbhn)
 
@@ -153,6 +241,75 @@ class BiLSTM(nn.Module):
         if labels is not None:
             loss_fn = nn.CrossEntropyLoss()
             loss = loss_fn(logits.view(-1, self.num_labels), labels.view(-1))
+
+        output = (logits,)
+
+        return ((loss,) + output) if loss is not None else output
+
+
+class MLP(nn.Module):
+    def __init__(
+        self, enc_model_path_or_name, emo_model_path_or_name, num_labels, dropout=0.1
+    ):
+        super().__init__()
+        self.fc = nn.Linear(768, num_labels)
+        self.dropout = nn.Dropout(dropout)
+        self.num_labels = num_labels
+        self.enc_model = AutoModel.from_pretrained(
+            enc_model_path_or_name, output_hidden_states=True
+        )
+        self.emo_model = AutoModel.from_pretrained(
+            emo_model_path_or_name, output_hidden_states=True
+        )
+        self.attn_gate = AttnGating(self.enc_model.config.hidden_size, dropout)
+
+        layer_start = 9
+        self.pooler = WeightedLayerPooling(
+            self.enc_model.config.num_hidden_layers,
+            layer_start=layer_start,
+            layer_weights=None,
+        )
+
+    def get_mean_pooling_embeds(self, last_hidden_state, attention_mask):
+        input_mask_expanded = (
+            attention_mask.unsqueeze(-1).expand(last_hidden_state.size()).float()
+        )
+        sum_embeddings = torch.sum(last_hidden_state * input_mask_expanded, 1)
+        sum_mask = input_mask_expanded.sum(1)
+        sum_mask = torch.clamp(sum_mask, min=1e-9)
+        mean_embeddings = sum_embeddings / sum_mask
+        return mean_embeddings
+
+    def forward(self, features, attn_mask=None, labels=None):
+        enc_outputs = self.enc_model(features, attention_mask=attn_mask)
+        enc_all_hidden_states = torch.stack(enc_outputs[2])
+        embeds = self.pooler(enc_all_hidden_states)
+        embeds = embeds[:, 0]
+        # embed = enc_outputs[1]
+        # embed = self.get_mean_pooling_embeds(enc_outputs[0], attn_mask)
+        # enc_last_hidden_state = enc_outputs[0]
+        # enc_input_mask_expanded = attn_mask.unsqueeze(-1).expand(enc_last_hidden_state.size()).float()
+        # enc_last_hidden_state[enc_input_mask_expanded == 0] = -1e9
+        # embed = torch.max(enc_last_hidden_state, 1)[0]
+
+        emo_outputs = self.emo_model(features, attention_mask=attn_mask)
+        emo_all_hidden_states = torch.stack(emo_outputs[2])
+        emo_embeds = self.pooler(emo_all_hidden_states)
+        emo_embeds = emo_embeds[:, 0]
+        # emo_embed = emo_outputs[1]
+        # emo_embed = self.get_mean_pooling_embeds(emo_outputs[0], attn_mask)
+        # emo_last_hidden_state = emo_outputs[0]
+        # emo_input_mask_expanded = attn_mask.unsqueeze(-1).expand(emo_last_hidden_state.size()).float()
+        # emo_last_hidden_state[emo_input_mask_expanded == 0] = -1e9
+        # emo_embed = torch.max(emo_last_hidden_state, 1)[0]
+
+        combined_embeds = self.attn_gate(embeds, emo_embeds)
+
+        logits = self.fc(combined_embeds)
+        loss = None
+        if labels is not None:
+            loss_fn = nn.CrossEntropyLoss()
+            loss = loss_fn(logits, labels)
 
         output = (logits,)
 
