@@ -24,9 +24,9 @@ class AttnGating(nn.Module):
 
     def forward(self, bert_embeddings, emotion_embeddings):
         # Concatnate word and emotion representations
-        features_combine = torch.cat((bert_embeddings, emotion_embeddings), axis=-1)
+        input_ids_combine = torch.cat((bert_embeddings, emotion_embeddings), axis=-1)
 
-        g_feature = self.relu(torch.matmul(features_combine, self.weight_emotion_W1))
+        g_feature = self.relu(torch.matmul(input_ids_combine, self.weight_emotion_W1))
 
         # Attention gating
         H = torch.mul(
@@ -88,12 +88,12 @@ class BertClassificationModel(nn.Module):
 
         self.classifier = nn.Linear(768, num_labels)
 
-    def forward(self, features, attn_mask=None, labels=None):
-        enc_outputs = self.enc_model(features, attention_mask=attn_mask)
+    def forward(self, input_ids, attention_mask=None, token_type_ids=None, labels=None):
+        enc_outputs = self.enc_model(input_ids, attention_mask=attention_mask)
         embeds = enc_outputs.hidden_states[0]
 
-        emo_outputs = self.emo_model(features, attention_mask=attn_mask)
-        emo_embeds = enc_outputs.hidden_states[0]
+        emo_outputs = self.emo_model(input_ids, attention_mask=attention_mask)
+        emo_embeds = emo_outputs.hidden_states[0]
 
         combined_embeds = self.attn_gate(embeds, emo_embeds)
 
@@ -160,11 +160,11 @@ class BiLSTMAttn(nn.Module):
 
         return new_hidden
 
-    def forward(self, features, attn_mask=None, labels=None):
-        enc_outputs = self.enc_model(features, attention_mask=attn_mask)
+    def forward(self, input_ids, attention_mask=None, token_type_ids=None, labels=None):
+        enc_outputs = self.enc_model(input_ids, attention_mask=attention_mask)
         embeds = enc_outputs.hidden_states[0]
 
-        emo_outputs = self.emo_model(features, attention_mask=attn_mask)
+        emo_outputs = self.emo_model(input_ids, attention_mask=attention_mask)
         emo_embeds = emo_outputs.hidden_states[0]
 
         combined_embeds = self.attn_gate(embeds, emo_embeds)
@@ -222,11 +222,11 @@ class BiLSTM(nn.Module):
 
         self.classifier = nn.Linear(hidden_dim * 2, num_labels)
 
-    def forward(self, features, attn_mask=None, labels=None):
-        enc_outputs = self.enc_model(features, attention_mask=attn_mask)
+    def forward(self, input_ids, attention_mask=None, token_type_ids=None, labels=None):
+        enc_outputs = self.enc_model(input_ids, attention_mask=attention_mask)
         embeds = enc_outputs.hidden_states[0]
 
-        emo_outputs = self.emo_model(features, attention_mask=attn_mask)
+        emo_outputs = self.emo_model(input_ids, attention_mask=attention_mask)
         emo_embeds = emo_outputs.hidden_states[0]
 
         combined_embeds = self.attn_gate(embeds, emo_embeds)
@@ -280,26 +280,26 @@ class MLP(nn.Module):
         mean_embeddings = sum_embeddings / sum_mask
         return mean_embeddings
 
-    def forward(self, features, attn_mask=None, labels=None):
-        enc_outputs = self.enc_model(features, attention_mask=attn_mask)
+    def forward(self, input_ids, attention_mask=None, token_type_ids=None, labels=None):
+        enc_outputs = self.enc_model(input_ids, attention_mask=attention_mask)
         enc_all_hidden_states = torch.stack(enc_outputs[2])
         embeds = self.pooler(enc_all_hidden_states)
         embeds = embeds[:, 0]
         # embed = enc_outputs[1]
-        # embed = self.get_mean_pooling_embeds(enc_outputs[0], attn_mask)
+        # embed = self.get_mean_pooling_embeds(enc_outputs[0], attention_mask)
         # enc_last_hidden_state = enc_outputs[0]
-        # enc_input_mask_expanded = attn_mask.unsqueeze(-1).expand(enc_last_hidden_state.size()).float()
+        # enc_input_mask_expanded = attention_mask.unsqueeze(-1).expand(enc_last_hidden_state.size()).float()
         # enc_last_hidden_state[enc_input_mask_expanded == 0] = -1e9
         # embed = torch.max(enc_last_hidden_state, 1)[0]
 
-        emo_outputs = self.emo_model(features, attention_mask=attn_mask)
+        emo_outputs = self.emo_model(input_ids, attention_mask=attention_mask)
         emo_all_hidden_states = torch.stack(emo_outputs[2])
         emo_embeds = self.pooler(emo_all_hidden_states)
         emo_embeds = emo_embeds[:, 0]
         # emo_embed = emo_outputs[1]
-        # emo_embed = self.get_mean_pooling_embeds(emo_outputs[0], attn_mask)
+        # emo_embed = self.get_mean_pooling_embeds(emo_outputs[0], attention_mask)
         # emo_last_hidden_state = emo_outputs[0]
-        # emo_input_mask_expanded = attn_mask.unsqueeze(-1).expand(emo_last_hidden_state.size()).float()
+        # emo_input_mask_expanded = attention_mask.unsqueeze(-1).expand(emo_last_hidden_state.size()).float()
         # emo_last_hidden_state[emo_input_mask_expanded == 0] = -1e9
         # emo_embed = torch.max(emo_last_hidden_state, 1)[0]
 

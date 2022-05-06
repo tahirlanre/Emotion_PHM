@@ -4,24 +4,19 @@ from datetime import datetime
 import math
 import os
 import random
-from pathlib import Path
-import shutil
 import copy
 
 import numpy as np
 import datasets
-from datasets import load_dataset, DatasetDict, load_from_disk, Dataset
+from datasets import load_dataset
 from tqdm import tqdm
 import wandb
-
 import torch
-import torch.nn as nn
 from torch.utils.data import DataLoader
 import transformers
 from transformers import (
     AdamW,
     AutoTokenizer,
-    AutoModel,
     SchedulerType,
     DataCollatorWithPadding,
     default_data_collator,
@@ -91,16 +86,10 @@ def parse_args():
         help="the name of the model to use. some models may use different model args than others.",
     )
     parser.add_argument(
-        "--per_device_train_batch_size",
+        "--batch_size",
         type=int,
         default=8,
         help="Batch size (per device) for the training dataloader.",
-    )
-    parser.add_argument(
-        "--per_device_eval_batch_size",
-        type=int,
-        default=8,
-        help="Batch size (per device) for the evaluation dataloader.",
     )
     parser.add_argument(
         "--learning_rate",
@@ -147,9 +136,6 @@ def parse_args():
         "--output_dir", type=str, default=None, help="Where to store the final model."
     )
     parser.add_argument(
-        "--seed", type=int, default=42, help="A seed for reproducible training."
-    )
-    parser.add_argument(
         "--save_steps",
         type=int,
         default=100,
@@ -188,8 +174,88 @@ def parse_args():
     return args
 
 
-def train():
-    pass
+def train(model, args, train_dataloader, eval_dataloader, max_train_steps, device):
+    # create optimizer
+    optimizer = AdamW(model.parameters(), lr=args.learning_rate)
+
+    # create scheduler for optimizer
+    lr_scheduler = tfoptim.get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=int((len(train_dataloader) * args.num_train_epochs) / 10),
+        num_training_steps=len(train_dataloader) * args.num_train_epochs,
+    )
+
+    progress_bar = tqdm(range(max_train_steps))
+    global_step = 0
+    best_val_loss = float("inf")
+    best_model = None
+
+    train_loss = 0.0
+    for epoch in range(args.num_train_epochs):
+        model.train()
+        for step, batch in enumerate(train_dataloader):
+            batch.to(device)
+            outputs = model(**batch)
+
+            loss = outputs[0]
+            loss = loss / args.gradient_accumulation_steps
+            train_loss += loss.item()
+            loss.backward()
+            if (
+                step % args.gradient_accumulation_steps == 0
+                or step == len(train_dataloader) - 1
+            ):
+                optimizer.step()
+                lr_scheduler.step()
+                optimizer.zero_grad()
+                progress_bar.update(1)
+                global_step += 1
+
+            # log interval loss
+            if global_step % args.log_interval == 0:
+                cur_loss = train_loss / args.log_interval
+                wandb.log({"train_loss": cur_loss})
+                logger.info(f"| epoch {epoch:3d} | loss {cur_loss:5.2f}")
+                train_loss = 0.0
+
+        eval_results = evaluate(model, eval_dataloader, device)
+        eval_loss = eval_results.pop("loss")
+
+        logger.info(f"| epoch {epoch:3d} | eval loss {eval_loss:5.2f}")
+        wandb.log({"eval_loss": eval_loss})
+
+        if eval_loss < best_val_loss:
+            best_model = copy.deepcopy(model)
+            best_val_loss = eval_loss
+
+    return best_model
+
+
+def evaluate(model, dataloader, device):
+    model.eval()
+    eval_loss = 0.0
+    y_pred = None
+    y_true = None
+
+    with torch.no_grad():
+        for step, batch in enumerate(dataloader):
+            batch.to(device)
+            outputs = model(**batch)
+
+            eval_loss += outputs[0].item()
+            if y_pred is None:
+                y_pred = outputs[1].argmax(dim=-1).detach().cpu().numpy()
+                y_true = batch["labels"].detach().cpu().numpy()
+            else:
+                y_pred = np.append(
+                    y_pred, outputs[1].argmax(dim=-1).detach().cpu().numpy(), axis=0
+                )
+                y_true = np.append(y_true, batch["labels"].detach().cpu().numpy())
+
+    results = compute_metrics(y_true, y_pred)
+    eval_loss = eval_loss / len(dataloader)
+    results.update({"loss": eval_loss})
+    return results
 
 
 def main():
@@ -211,12 +277,12 @@ def main():
         else datetime.now().strftime("%d_%m_%Y_%H_%M_%S")
     )
     if args.output_dir:
-        output_dir = os.path.join(args.output_dir, run_name)
+        args.output_dir = os.path.join(args.output_dir, run_name)
     else:
-        output_dir = os.path.join("runs", run_name)
-        os.makedirs(output_dir, exist_ok=True)
+        args.output_dir = os.path.join("runs", run_name)
+        os.makedirs(args.output_dir, exist_ok=True)
 
-    best_result, best_val = {}, []
+    seed_results, best_val = [], []
     for i in range(args.num_restarts):
         seed = SEEDS[i]
         set_seed(seed)
@@ -238,7 +304,6 @@ def main():
         label_to_id = {v: i for i, v in enumerate(label_list)}
         num_labels = len(label_list)
 
-        # config = AutoConfig.from_pretrained(args.model_name_or_path, num_labels=num_labels)
         tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
 
         if args.model == "bert":
@@ -320,46 +385,31 @@ def main():
             train_dataset,
             shuffle=True,
             collate_fn=data_collator,
-            batch_size=args.per_device_train_batch_size,
+            batch_size=args.batch_size,
         )
         eval_dataloader = DataLoader(
             eval_dataset,
             collate_fn=data_collator,
-            batch_size=args.per_device_eval_batch_size,
+            batch_size=args.batch_size,
         )
         test_dataloader = DataLoader(
             test_dataset,
             collate_fn=data_collator,
-            batch_size=args.per_device_eval_batch_size,
+            batch_size=args.batch_size,
         )
 
-        # create optimizer
-        optimizer = AdamW(model.parameters(), lr=args.learning_rate)
-
+        total_batch_size = args.batch_size * args.gradient_accumulation_steps
         num_update_steps_per_epoch = math.ceil(
             len(train_dataloader) / args.gradient_accumulation_steps
         )
         max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
-
-        # create scheduler for optimizer
-        lr_scheduler = tfoptim.get_linear_schedule_with_warmup(
-            optimizer,
-            num_warmup_steps=int((len(train_dataloader) * args.num_train_epochs) / 10),
-            num_training_steps=len(train_dataloader) * args.num_train_epochs,
-        )
-
-        total_batch_size = (
-            args.per_device_train_batch_size * args.gradient_accumulation_steps
-        )
 
         logger.info(
             f"***** Running training {i} of {args.num_restarts} with seed = {seed} *****"
         )
         logger.info(f"  Num examples = {len(train_dataset)}")
         logger.info(f"  Num Epochs = {args.num_train_epochs}")
-        logger.info(
-            f"  Instantaneous batch size per device = {args.per_device_train_batch_size}"
-        )
+        logger.info(f"  Instantaneous batch size per device = {args.batch_size}")
         logger.info(
             f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}"
         )
@@ -368,149 +418,34 @@ def main():
         )
         logger.info(f"  Total optimization steps = {max_train_steps}")
 
-        progress_bar = tqdm(range(max_train_steps))
-        global_step = 0
-        best_val_loss = float("inf")
-        best_model = None
-
-        train_loss = 0.0
-        for epoch in range(args.num_train_epochs):
-            model.train()
-            for step, batch in enumerate(train_dataloader):
-                batch.to(device)
-                outputs = model(
-                    batch["input_ids"], batch["attention_mask"], batch["labels"]
-                )
-
-                loss = outputs[0]
-                loss = loss / args.gradient_accumulation_steps
-                train_loss += loss.item()
-                loss.backward()
-                if (
-                    step % args.gradient_accumulation_steps == 0
-                    or step == len(train_dataloader) - 1
-                ):
-                    optimizer.step()
-                    lr_scheduler.step()
-                    optimizer.zero_grad()
-                    progress_bar.update(1)
-                    global_step += 1
-
-                # log interval loss
-                if global_step % args.log_interval == 0:
-                    cur_loss = train_loss / args.log_interval
-                    wandb.log({"train_loss": cur_loss})
-                    logger.info(f"| epoch {epoch:3d} | loss {cur_loss:5.2f}")
-                    train_loss = 0.0
-
-                # if global_step >= args.max_train_steps:
-                #     break
-
-            model.eval()
-            eval_loss = 0.0
-            y_pred = None
-            y_true = None
-
-            for step, batch in enumerate(eval_dataloader):
-                batch.to(device)
-                outputs = model(
-                    batch["input_ids"], batch["attention_mask"], batch["labels"]
-                )
-
-                eval_loss += outputs[0].item()
-                if y_pred is None:
-                    y_pred = outputs[1].argmax(dim=-1).detach().cpu().numpy()
-                    y_true = batch["labels"].detach().cpu().numpy()
-                else:
-                    y_pred = np.append(
-                        y_pred, outputs[1].argmax(dim=-1).detach().cpu().numpy(), axis=0
-                    )
-                    y_true = np.append(y_true, batch["labels"].detach().cpu().numpy())
-
-            eval_loss = eval_loss / len(eval_dataloader)
-            results = {
-                "loss": eval_loss,
-            }
-            logger.info(f"| epoch {epoch:3d} | eval loss {eval_loss:5.2f}")
-            wandb.log({"eval_loss": eval_loss})
-
-            result = compute_metrics(y_true, y_pred)
-            results.update(result)
-
-            if args.output_dir is not None:
-                eval_output_dir = os.path.join(output_dir, "eval")
-                os.makedirs(eval_output_dir, exist_ok=True)
-
-                output_eval_file = os.path.join(
-                    eval_output_dir,
-                    f"eval_{epoch+1}.txt" if global_step else "eval.txt",
-                )
-                with open(output_eval_file, "w") as f_w:
-                    logger.info(
-                        f"*****  Evaluation results on eval dataset - Epoch: {epoch+1} *****"
-                    )
-                    for key in sorted(results.keys()):
-                        # logger.info(f" {key} = {str(eval_metric[key])}")
-                        f_w.write(f" {key} = {str(results[key])}\n")
-
-            if eval_loss < best_val_loss:
-                if args.output_dir is not None:
-                    logger.info(f"Saving best model to {output_dir}")
-                    model_to_save = model.module if hasattr(model, "module") else model
-                    model_to_save.save_pretrained(output_dir)
-                    tokenizer.save_pretrained(output_dir)
-                    best_val_loss = eval_loss
-                else:
-                    best_model = copy.deepcopy(model)
-                    best_val_loss = eval_loss
-
-        y_pred = None
-        y_true = None
-        best_model.eval()
-        with torch.no_grad():
-            for step, batch in enumerate(test_dataloader):
-                batch.to(device)
-                outputs = model(
-                    batch["input_ids"], batch["attention_mask"], batch["labels"]
-                )
-
-                if y_pred is None:
-                    y_pred = outputs[1].argmax(dim=-1).detach().cpu().numpy()
-                    y_true = batch["labels"].detach().cpu().numpy()
-                else:
-                    y_pred = np.append(
-                        y_pred, outputs[1].argmax(dim=-1).detach().cpu().numpy(), axis=0
-                    )
-                    y_true = np.append(y_true, batch["labels"].detach().cpu().numpy())
-
-        results = compute_metrics(y_true, y_pred)
-
-        output_test_file = os.path.join(output_dir, f"test_results_{seed}.txt")
-        output_prediction_file = os.path.join(
-            output_dir, f"test_predictions_{seed}.txt"
+        best_model = train(
+            model, args, train_dataloader, eval_dataloader, max_train_steps, device
         )
+
+        test_results = evaluate(best_model, test_dataloader, device)
+
+        output_test_file = os.path.join(args.output_dir, f"test_results_{seed}.txt")
 
         with open(output_test_file, "w") as f_w:
             logger.info("***** Eval results on test dataset *****")
-            for key in sorted(results.keys()):
-                logger.info("  {} = {}".format(key, str(results[key])))
-                f_w.write("  {} = {}\n".format(key, str(results[key])))
+            for key in sorted(test_results.keys()):
+                logger.info("  {} = {}".format(key, str(test_results[key])))
+                f_w.write("  {} = {}\n".format(key, str(test_results[key])))
 
-        with open(output_prediction_file, "w") as f_w:
-            f_w.write("index\tprediction\n")
-            for index, item in enumerate(y_pred):
-                item = label_list[item]
-                f_w.write(f"{index}\t{item}\n")
+        seed_results.append(test_results)
 
-        best_result[seed] = results
-
-    output_avg_test_file = os.path.join(output_dir, f"test_results-{args.model}.txt")
+    output_avg_test_file = os.path.join(args.output_dir, "test_results.txt")
     logger.info(f"*****  Average eval results on test dataset *****")
     with open(output_avg_test_file, "w") as f_w:
-        for key in sorted(results.keys()):
-            avg_value = np.mean([d[key] for d in best_result.values()])
+        f_w.write(f"lr = {args.learning_rate}\n")
+        f_w.write(f"model = {args.model}\n")
+        f_w.write(f"batch_size = {args.batch_size}\n")
+        f_w.write(f"emotion_model = {args.emotion_model_name_or_path}\n")
+        f_w.write("\n")
+        for key in sorted(seed_results[0].keys()):
+            avg_value = np.mean([result[key] for result in seed_results])
             logger.info("  {} = {}".format(key, str(avg_value)))
-            f_w.write("  {} = {}\n".format(key, str(avg_value)))
+            f_w.write("{} = {}\n".format(key, str(avg_value)))
 
 
 if __name__ == "__main__":
