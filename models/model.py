@@ -304,6 +304,7 @@ class MLP(nn.Module):
         # emo_embed = torch.max(emo_last_hidden_state, 1)[0]
 
         combined_embeds = self.attn_gate(embeds, emo_embeds)
+        combined_embeds = self.dropout(combined_embeds)
 
         logits = self.fc(combined_embeds)
         loss = None
