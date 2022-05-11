@@ -65,20 +65,6 @@ def parse_args():
     #     help="A csv or a csv file containing the test data.",
     # )
     parser.add_argument(
-        "--max_seq_length",
-        type=int,
-        default=50,
-        help=(
-            "The maximum total input sequence length after tokenization. Sequences longer than this will be truncated,"
-            " sequences shorter will be padded if `--pad_to_max_lengh` is passed."
-        ),
-    )
-    parser.add_argument(
-        "--pad_to_max_length",
-        action="store_true",
-        help="If passed, pad all samples to `max_length`. Otherwise, dynamic padding is used.",
-    )
-    parser.add_argument(
         "--model_name_or_path",
         type=str,
         help="Path to pretrained model or model identifier from huggingface.co/models.",
@@ -109,9 +95,9 @@ def parse_args():
         default=1e-5,
         help="Initial learning rate (after the potential warmup period) to use.",
     )
-    parser.add_argument(
-        "--weight_decay", type=float, default=0.0, help="Weight decay to use."
-    )
+    # parser.add_argument(
+    #     "--weight_decay", type=float, default=0.0, help="Weight decay to use."
+    # )
     parser.add_argument(
         "--num_train_epochs",
         type=int,
@@ -123,20 +109,6 @@ def parse_args():
         type=int,
         default=1,
         help="Number of updates steps to accumulate before performing a backward/update pass.",
-    )
-    parser.add_argument(
-        "--lr_scheduler_type",
-        type=SchedulerType,
-        default="linear",
-        help="The scheduler type to use.",
-        choices=[
-            "linear",
-            "cosine",
-            "cosine_with_restarts",
-            "polynomial",
-            "constant",
-            "constant_with_warmup",
-        ],
     )
     parser.add_argument(
         "--num_warmup_steps",
@@ -259,20 +231,10 @@ def setup_model(args, num_labels):
 
 
 def train(model, train_dataloader, eval_dataloader, args):
-
     num_update_steps_per_epoch = math.ceil(
         len(train_dataloader) / args.gradient_accumulation_steps
     )
     max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
-
-    # logger.info(f"  Num examples = {len(train_dataset)}")
-    logger.info(f"  Num Epochs = {args.num_train_epochs}")
-    logger.info(f"  Instantaneous batch size per device = {args.batch_size}")
-    # logger.info(
-    #     f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}"
-    # )
-    logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
-    logger.info(f"  Total optimization steps = {max_train_steps}")
 
     # create optimizer
     optimizer = AdamW(model.parameters(), lr=args.learning_rate)
@@ -328,17 +290,11 @@ def train(model, train_dataloader, eval_dataloader, args):
             best_val_loss = eval_loss
             best_dev_results = eval_results
 
-    if best_model:
-        model = copy.deepcopy(model)
-
-    return best_dev_results
+    return best_model, best_dev_results
 
 
 def train_main(seed, args):
     set_seed(seed)
-
-    logger.info(f"***** Running training with seed = {seed} *****")
-
     X_train, y_train, X_val, y_val, X_test, y_test = read_data(args.data_dir)
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
 
@@ -370,17 +326,18 @@ def train_main(seed, args):
         batch_size=args.batch_size,
     )
 
-    best_dev_results = train(model, train_dataloader, val_dataloader, args)
+    logger.info("=" * 40)
+    logger.info(f"  Random seed = {seed}")
+    logger.info(args)
+    logger.info("=" * 40)
 
-    _, test_results = evaluate(model, test_dataloader)
+    best_model, best_dev_results = train(model, train_dataloader, val_dataloader, args)
 
-    output_test_file = os.path.join(args.output_dir, f"test_results_{seed}.txt")
+    _, test_results = evaluate(best_model, test_dataloader)
 
-    with open(output_test_file, "w") as f_w:
-        logger.info(f"***** Eval results on test dataset with seed = {seed}*****")
-        for key in sorted(test_results.keys()):
-            logger.info("  {} = {}".format(key, str(test_results[key])))
-            f_w.write("  {} = {}\n".format(key, str(test_results[key])))
+    logger.info(f"***** Eval results on test dataset*****")
+    for key in sorted(test_results.keys()):
+        logger.info("  {} = {}".format(key, str(test_results[key])))
 
     results = {"best_dev_results": best_dev_results, "test_results": test_results}
 
@@ -431,12 +388,12 @@ def tune(parameters, args):
                 for metric in metrics:
                     collector[metric] += metrics[metric] / args.num_restarts
 
-            return {
-                "dev f1": (avg_dev["macro_f1"], 0),
-                "test f1": (avg_eval["macro_f1"], 0),
-                "dev accuracy": (avg_dev["accuracy"], 0),
-                "test accuracy": (avg_eval["accuracy"], 0),
-            }
+        return {
+            "dev f1": (avg_dev["macro_f1"], 0),
+            "test f1": (avg_eval["macro_f1"], 0),
+            "dev accuracy": (avg_dev["accuracy"], 0),
+            "test accuracy": (avg_eval["accuracy"], 0),
+        }
 
     best_parameters, values, experiment, best_model = ax.service.managed_loop.optimize(
         parameters=parameters,
@@ -463,19 +420,17 @@ def tune(parameters, args):
 
     print(best_parameters)
 
-    if args.output_dir is not None:
-        dataset = args.data_dir.rstrip("/").split("/")[-1]
-        with open(f"./{args.model}_{dataset}_params.json", "w") as f:
-            f.write(json.dumps(best_parameters))
+    # save best parameters
+    dataset = args.data_dir.rstrip("/").split("/")[-1]
+    with open(f"./{args.model}_{dataset}_params.json", "w") as f:
+        f.write(json.dumps(best_parameters))
+
+    return best_parameters
 
 
 def main():
     args = parse_args()
-
     init_logger()
-
-    datasets.utils.logging.set_verbosity_error()
-    transformers.utils.logging.set_verbosity_error()
 
     wandb.login()
     wandb.init(project="phm-classification")
@@ -527,39 +482,33 @@ def main():
         else:
             raise ValueError("Don't know how to tune that yet.")
 
-        tune(parameters, args)
+        best_parameters = tune(parameters, args)
     else:
         logging.info("***** Loading best parameters *****")
         dataset = args.data_dir.rstrip("/").split("/")[-1]
         with open(f"./{args.model}_{dataset}_params.json", "r") as f:
             best_parameters = json.load(f)
 
-        for param_name in best_parameters:
-            if param_name == "dropout":
-                args.dropout = best_parameters[param_name]
-            elif param_name == "batch_size":
-                args.batch_size = best_parameters[param_name]
-            if param_name == "hidden_dim":
-                args.hidden_dim = best_parameters[param_name]
-            elif param_name == "learning_rate":
-                args.learning_rate = best_parameters[param_name]
+    for param_name in best_parameters:
+        if param_name == "dropout":
+            args.dropout = best_parameters[param_name]
+        elif param_name == "batch_size":
+            args.batch_size = best_parameters[param_name]
+        if param_name == "hidden_dim":
+            args.hidden_dim = best_parameters[param_name]
+        elif param_name == "learning_rate":
+            args.learning_rate = best_parameters[param_name]
 
-        seed_results = []
-        for i in range(args.num_restarts):
-            test_results = train_main(SEEDS[i], args)
-            seed_results.append(test_results["test_results"])
-        output_avg_test_file = os.path.join(args.output_dir, "test_results.txt")
-        logger.info(f"*****  Average eval results on test dataset *****")
-        with open(output_avg_test_file, "w") as f_w:
-            f_w.write(f"lr = {args.learning_rate}\n")
-            f_w.write(f"model = {args.model}\n")
-            f_w.write(f"batch_size = {args.batch_size}\n")
-            f_w.write(f"emotion_model = {args.emotion_model_name_or_path}\n")
-            f_w.write("\n")
-            for key in sorted(seed_results[0].keys()):
-                avg_value = np.mean([result[key] for result in seed_results])
-                logger.info("  {} = {}".format(key, str(avg_value)))
-                f_w.write("{} = {}\n".format(key, str(avg_value)))
+    seed_results = []
+    for i in range(args.num_restarts):
+        logging.info(f"***** Running Training #{i+1} of {args.num_restarts} *****")
+        test_results = train_main(SEEDS[i], args)
+        seed_results.append(test_results["test_results"])
+
+    logger.info(f"***** Average eval results on test dataset *****")
+    for key in sorted(seed_results[0].keys()):
+        avg_value = np.mean([result[key] for result in seed_results])
+        logger.info("  {} = {}".format(key, str(avg_value)))
 
 
 if __name__ == "__main__":

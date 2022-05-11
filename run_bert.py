@@ -1,18 +1,16 @@
 import argparse
+import imp
 import logging
 from datetime import datetime
 import math
 import os
 import random
-from pathlib import Path
-import shutil
 import copy
 
 import datasets
 from datasets import load_dataset, DatasetDict
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from sklearn.metrics import classification_report
 
 import numpy as np
 
@@ -28,10 +26,10 @@ from transformers import (
     default_data_collator,
     get_scheduler,
 )
+import wandb
 
 from utils.utils import init_logger, set_seed, compute_metrics
-
-import wandb
+from const import SEEDS
 
 logger = logging.getLogger(__name__)
 
@@ -176,21 +174,9 @@ def main():
         output_dir = os.path.join("runs", run_name)
         os.makedirs(output_dir, exist_ok=True)
 
-    random_seeds = [
-        69556,
-        79719,
-        30010,
-        46921,
-        25577,
-        52538,
-        56440,
-        41228,
-        66558,
-        48642,
-    ]
     best_result, best_val = {}, []
 
-    for seed in random_seeds:
+    for seed in SEEDS:
         set_seed(seed)
 
         raw_dataset = load_dataset("csv", data_files=args.train_file, split="train")
@@ -333,7 +319,8 @@ def main():
             args.per_device_train_batch_size * args.gradient_accumulation_steps
         )
 
-        logger.info(f"***** Running training with seed = {seed} *****")
+        logger.info(f"***** Running training *****")
+        logger.info(f"  Random seed = {seed}")
         logger.info(f"  Num examples = {len(train_dataset)}")
         logger.info(f"  Num Epochs = {args.num_train_epochs}")
         logger.info(

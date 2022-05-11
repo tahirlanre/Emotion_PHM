@@ -137,3 +137,5 @@ runs/
 wandb/
 
 teacher_preds/
+
+*.json
