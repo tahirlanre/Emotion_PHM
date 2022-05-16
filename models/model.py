@@ -263,48 +263,17 @@ class MLP(nn.Module):
         )
         self.attn_gate = AttnGating(self.enc_model.config.hidden_size, dropout)
 
-        layer_start = 9
-        self.pooler = WeightedLayerPooling(
-            self.enc_model.config.num_hidden_layers,
-            layer_start=layer_start,
-            layer_weights=None,
-        )
-
-    def get_mean_pooling_embeds(self, last_hidden_state, attention_mask):
-        input_mask_expanded = (
-            attention_mask.unsqueeze(-1).expand(last_hidden_state.size()).float()
-        )
-        sum_embeddings = torch.sum(last_hidden_state * input_mask_expanded, 1)
-        sum_mask = input_mask_expanded.sum(1)
-        sum_mask = torch.clamp(sum_mask, min=1e-9)
-        mean_embeddings = sum_embeddings / sum_mask
-        return mean_embeddings
-
     def forward(self, input_ids, attention_mask=None, token_type_ids=None, labels=None):
         enc_outputs = self.enc_model(input_ids, attention_mask=attention_mask)
-        enc_all_hidden_states = torch.stack(enc_outputs[2])
-        embeds = self.pooler(enc_all_hidden_states)
-        embeds = embeds[:, 0]
-        # embed = enc_outputs[1]
-        # embed = self.get_mean_pooling_embeds(enc_outputs[0], attention_mask)
-        # enc_last_hidden_state = enc_outputs[0]
-        # enc_input_mask_expanded = attention_mask.unsqueeze(-1).expand(enc_last_hidden_state.size()).float()
-        # enc_last_hidden_state[enc_input_mask_expanded == 0] = -1e9
-        # embed = torch.max(enc_last_hidden_state, 1)[0]
+        embeds = enc_outputs[1]
+        embeds = self.dropout(embeds)
 
         emo_outputs = self.emo_model(input_ids, attention_mask=attention_mask)
-        emo_all_hidden_states = torch.stack(emo_outputs[2])
-        emo_embeds = self.pooler(emo_all_hidden_states)
-        emo_embeds = emo_embeds[:, 0]
-        # emo_embed = emo_outputs[1]
-        # emo_embed = self.get_mean_pooling_embeds(emo_outputs[0], attention_mask)
-        # emo_last_hidden_state = emo_outputs[0]
-        # emo_input_mask_expanded = attention_mask.unsqueeze(-1).expand(emo_last_hidden_state.size()).float()
-        # emo_last_hidden_state[emo_input_mask_expanded == 0] = -1e9
-        # emo_embed = torch.max(emo_last_hidden_state, 1)[0]
+        emo_embeds = emo_outputs[1]
+        emo_embeds = self.dropout(emo_embeds)
 
         combined_embeds = self.attn_gate(embeds, emo_embeds)
-        combined_embeds = self.dropout(combined_embeds)
+        # combined_embeds = self.dropout(combined_embeds)
 
         logits = self.fc(combined_embeds)
         loss = None

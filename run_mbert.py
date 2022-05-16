@@ -156,7 +156,7 @@ def parse_args():
     parser.add_argument(
         "--trials",
         type=int,
-        default=20,
+        default=50,
         help="number of hyperparameter trials to attempt. ignored if not optimizing.",
     )
     parser.add_argument(
@@ -293,7 +293,7 @@ def train(model, train_dataloader, eval_dataloader, args):
     return best_model, best_dev_results
 
 
-def train_main(seed, args):
+def train_main(args, seed=42):
     set_seed(seed)
     X_train, y_train, X_val, y_val, X_test, y_test = read_data(args.data_dir)
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
@@ -352,7 +352,6 @@ def evaluate(model, dataloader):
 
     with torch.no_grad():
         for step, batch in enumerate(dataloader):
-            # batch.to(device)
             batch = {key: batch[key].to(device) for key in batch}
             outputs = model(**batch)
 
@@ -379,14 +378,14 @@ def tune(parameters, args):
         avg_dev = defaultdict(float)
         avg_eval = defaultdict(float)
 
-        for i in range(args.num_restarts):
-            results = train_main(SEEDS[i], args)
-            for collector, metrics in zip(
-                [avg_dev, avg_eval],
-                [results["best_dev_results"], results["test_results"]],
-            ):
-                for metric in metrics:
-                    collector[metric] += metrics[metric] / args.num_restarts
+        # for i in range(args.num_restarts):
+        results = train_main(args)
+        for collector, metrics in zip(
+            [avg_dev, avg_eval],
+            [results["best_dev_results"], results["test_results"]],
+        ):
+            for metric in metrics:
+                collector[metric] += metrics[metric] / args.num_restarts
 
         return {
             "dev f1": (avg_dev["macro_f1"], 0),
@@ -461,7 +460,7 @@ def main():
                     "bounds": [0.0, 1.0],
                     "value_type": "float",
                 },
-                {"name": "batch_size", "type": "choice", "values": [16, 32, 64, 128]},
+                {"name": "batch_size", "type": "choice", "values": [32, 64, 128]},
             ]
         elif args.model == "bilstm" or args.model == "bilstm-attn":
             parameters = [
@@ -471,7 +470,7 @@ def main():
                     "bounds": [0.0, 1.0],
                     "value_type": "float",
                 },
-                {"name": "batch_size", "type": "choice", "values": [16, 32, 64, 128]},
+                {"name": "batch_size", "type": "choice", "values": [32, 64, 128]},
                 {"name": "hidden_dim", "type": "choice", "values": [128, 256, 512]},
                 {
                     "name": "learning_rate",
@@ -502,7 +501,7 @@ def main():
     seed_results = []
     for i in range(args.num_restarts):
         logging.info(f"***** Running Training #{i+1} of {args.num_restarts} *****")
-        test_results = train_main(SEEDS[i], args)
+        test_results = train_main(args, seed=SEEDS[i])
         seed_results.append(test_results["test_results"])
 
     logger.info(f"***** Average eval results on test dataset *****")
