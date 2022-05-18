@@ -26,7 +26,7 @@ from transformers import (
 import transformers.optimization as tfoptim
 import ax
 
-from models.model import BertClassificationModel, BiLSTMAttn, BiLSTM, MLP
+from models.model import BertClassificationModel, BiLSTMAttn, BiLSTM, MLP, EmoBERTMLP
 from utils.utils import init_logger, set_seed, compute_metrics
 from const import SEEDS
 from data import PHMDataset
@@ -79,7 +79,7 @@ def parse_args():
     parser.add_argument(
         "--model",
         type=str,
-        choices=["bert", "bilstm_attn", "bilstm", "mlp"],
+        choices=["bert", "bilstm_attn", "bilstm", "mlp", "emobert"],
         required=True,
         help="the name of the model to use. some models may use different model args than others.",
     )
@@ -226,6 +226,8 @@ def setup_model(args, num_labels):
             num_labels,
             args.dropout,
         )
+    elif args.model == "emobert":
+        model = EmoBERTMLP(args.emotion_model_name_or_path, num_labels, args.dropout)
 
     return model
 
@@ -446,7 +448,7 @@ def main():
         os.makedirs(args.output_dir, exist_ok=True)
 
     if args.tune:
-        if args.model == "bert" or args.model == "mlp":
+        if args.model == "bert" or args.model == "mlp" or args.model == "emobert":
             parameters = [
                 {
                     "name": "learning_rate",
@@ -460,7 +462,7 @@ def main():
                     "bounds": [0.0, 1.0],
                     "value_type": "float",
                 },
-                {"name": "batch_size", "type": "choice", "values": [32, 64, 128]},
+                {"name": "batch_size", "type": "choice", "values": [32, 64]},
             ]
         elif args.model == "bilstm" or args.model == "bilstm-attn":
             parameters = [

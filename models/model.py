@@ -273,9 +273,37 @@ class MLP(nn.Module):
         emo_embeds = self.dropout(emo_embeds)
 
         combined_embeds = self.attn_gate(embeds, emo_embeds)
-        # combined_embeds = self.dropout(combined_embeds)
 
         logits = self.fc(combined_embeds)
+        loss = None
+        if labels is not None:
+            loss_fn = nn.CrossEntropyLoss()
+            loss = loss_fn(logits, labels)
+
+        output = (logits,)
+
+        return ((loss,) + output) if loss is not None else output
+
+
+class EmoBERTMLP(nn.Module):
+    def __init__(self, emo_model_name_or_path, num_labels, dropout=0.1) -> None:
+        super().__init__()
+
+        self.enc_model = AutoModel.from_pretrained(emo_model_name_or_path)
+        self.num_labels = num_labels
+
+        self.classifier = nn.Linear(768, num_labels)
+
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, input_ids, attention_mask=None, token_type_ids=None, labels=None):
+        outputs = self.enc_model(input_ids, attention_mask=attention_mask)
+
+        pooled_output = outputs[1]
+
+        pooled_output = self.dropout(pooled_output)
+        logits = self.classifier(pooled_output)
+
         loss = None
         if labels is not None:
             loss_fn = nn.CrossEntropyLoss()
