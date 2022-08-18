@@ -46,7 +46,7 @@ from transformers import (
 from transformers.utils import get_full_repo_name, send_example_telemetry
 from transformers.utils.versions import require_version
 
-from models.model import BERT_MTL, BERT_STL
+from models.model import BERT_MTL, BERT_MTL_ATTN, BERT_STL
 
 
 logger = get_logger(__name__)
@@ -108,7 +108,7 @@ def parse_args():
     parser.add_argument(
         "--model",
         type=str,
-        choices=["mtl", "stl"],
+        choices=["mtl", "mtl_attn", "stl"],
         required=True,
         help="the name of the model to use. some models may use different model args than others.",
     )
@@ -260,7 +260,7 @@ def parse_args():
             args.output_dir is not None
         ), "Need an `output_dir` to create a repo when `--push_to_hub` is passed."
 
-    if args.model == "mlp":
+    if args.model == "mlp" or args.model == "mlp_attn":
         if args.emotion_model_name_or_path is None:
             raise ValueError("Need an emotion pre-trained model")
 
@@ -441,6 +441,12 @@ def main():
                 args.emotion_model_name_or_path,
                 num_labels,
                 # args.dropout,
+            )
+        elif args.model == "mtl_attn":
+            model = BERT_MTL_ATTN(
+                args.model_name_or_path,
+                args.emotion_model_name_or_path,
+                num_labels,
             )
 
         # Preprocessing the datasets
