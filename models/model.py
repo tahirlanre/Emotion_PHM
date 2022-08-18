@@ -247,12 +247,12 @@ class BiLSTM(nn.Module):
         return ((loss,) + output) if loss is not None else output
 
 
-class MLP(nn.Module):
+class BERT_MTL(nn.Module):
     def __init__(
-        self, enc_model_path_or_name, emo_model_path_or_name, num_labels, dropout=0.1
+        self, enc_model_path_or_name, emo_model_path_or_name, num_labels, dropout=0.2
     ):
         super().__init__()
-        self.fc = nn.Linear(768, num_labels)
+        self.fc = nn.Linear(768 * 2, num_labels)
         self.dropout = nn.Dropout(dropout)
         self.num_labels = num_labels
         self.enc_model = AutoModel.from_pretrained(
@@ -261,7 +261,7 @@ class MLP(nn.Module):
         self.emo_model = AutoModel.from_pretrained(
             emo_model_path_or_name, output_hidden_states=True
         )
-        self.attn_gate = AttnGating(self.enc_model.config.hidden_size, dropout)
+        # self.attn_gate = AttnGating(self.enc_model.config.hidden_size, dropout)
 
     def forward(self, input_ids, attention_mask=None, token_type_ids=None, labels=None):
         enc_outputs = self.enc_model(input_ids, attention_mask=attention_mask)
@@ -272,7 +272,7 @@ class MLP(nn.Module):
         emo_embeds = emo_outputs[1]
         emo_embeds = self.dropout(emo_embeds)
 
-        combined_embeds = self.attn_gate(embeds, emo_embeds)
+        combined_embeds = torch.cat((embeds, emo_embeds), 1)
 
         logits = self.fc(combined_embeds)
         loss = None
@@ -285,11 +285,11 @@ class MLP(nn.Module):
         return ((loss,) + output) if loss is not None else output
 
 
-class EmoBERTMLP(nn.Module):
-    def __init__(self, emo_model_name_or_path, num_labels, dropout=0.1) -> None:
+class BERT_STL(nn.Module):
+    def __init__(self, enc_model_name_or_path, num_labels, dropout=0.2) -> None:
         super().__init__()
 
-        self.enc_model = AutoModel.from_pretrained(emo_model_name_or_path)
+        self.enc_model = AutoModel.from_pretrained(enc_model_name_or_path)
         self.num_labels = num_labels
 
         self.classifier = nn.Linear(768, num_labels)

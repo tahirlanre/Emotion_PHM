@@ -18,7 +18,6 @@ import json
 import logging
 import math
 import os
-import random
 from pathlib import Path
 
 import datasets
@@ -46,6 +45,8 @@ from transformers import (
 )
 from transformers.utils import get_full_repo_name, send_example_telemetry
 from transformers.utils.versions import require_version
+
+from models.model import BERT_MTL, BERT_STL
 
 
 logger = get_logger(__name__)
@@ -97,6 +98,19 @@ def parse_args():
         type=str,
         help="Path to pretrained model or model identifier from huggingface.co/models.",
         required=True,
+    )
+    parser.add_argument(
+        "--emotion_model_name_or_path",
+        type=str,
+        help="Path to pretrained model on emotion representatons.",
+        # required=True,
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        choices=["mtl", "stl"],
+        required=True,
+        help="the name of the model to use. some models may use different model args than others.",
     )
     parser.add_argument(
         "--use_slow_tokenizer",
@@ -166,7 +180,10 @@ def parse_args():
         "--output_dir", type=str, default=None, help="Where to store the final model."
     )
     parser.add_argument(
-        "--seed", type=int, default=None, help="A seed for reproducible training."
+        "--seed", type=int, default=42, help="A seed for reproducible training."
+    )
+    parser.add_argument(
+        "--k_folds", type=int, default=5, help="Number of folds for cross validation"
     )
     parser.add_argument(
         "--push_to_hub",
@@ -242,6 +259,10 @@ def parse_args():
         assert (
             args.output_dir is not None
         ), "Need an `output_dir` to create a repo when `--push_to_hub` is passed."
+
+    if args.model == "mlp":
+        if args.emotion_model_name_or_path is None:
+            raise ValueError("Need an emotion pre-trained model")
 
     return args
 
@@ -339,21 +360,14 @@ def main():
     #         num_labels = 1
     # else:
     # Trying to have good defaults here, don't hesitate to tweak to your needs.
-    is_regression = raw_datasets["train"].features["label"].dtype in [
-        "float32",
-        "float64",
-    ]
-    if is_regression:
-        num_labels = 1
-    else:
-        # A useful fast method:
-        # https://huggingface.co/docs/datasets/package_reference/main_classes.html#datasets.Dataset.unique
-        label_list = raw_datasets["train"].unique("label")
-        label_list.sort()  # Let's sort it for determinism
-        num_labels = len(label_list)
+    # A useful fast method:
+    # https://huggingface.co/docs/datasets/package_reference/main_classes.html#datasets.Dataset.unique
+    label_list = raw_datasets["train"].unique("label")
+    label_list.sort()  # Let's sort it for determinism
+    num_labels = len(label_list)
     label_to_id = {v: i for i, v in enumerate(label_list)}
 
-    k_folds = 5
+    k_folds = args.k_folds
 
     # For fold results
     results = {}
@@ -415,12 +429,19 @@ def main():
         #
         # In distributed training, the .from_pretrained methods guarantee that only one local process can concurrently
         # download model & vocab.
-        model = AutoModelForSequenceClassification.from_pretrained(
-            args.model_name_or_path,
-            from_tf=bool(".ckpt" in args.model_name_or_path),
-            config=config,
-            ignore_mismatched_sizes=args.ignore_mismatched_sizes,
-        )
+        if args.model == "stl":
+            model = BERT_STL(
+                args.model_name_or_path,
+                num_labels,
+                # args.dropout,
+            )
+        elif args.model == "mtl":
+            model = BERT_MTL(
+                args.model_name_or_path,
+                args.emotion_model_name_or_path,
+                num_labels,
+                # args.dropout,
+            )
 
         # Preprocessing the datasets
         # if args.task_name is not None:
@@ -460,8 +481,10 @@ def main():
         # elif args.task_name is None and not is_regression:
 
         if label_to_id is not None:
-            model.config.label2id = label_to_id
-            model.config.id2label = {id: label for label, id in config.label2id.items()}
+            model.enc_model.config.label2id = label_to_id
+            model.enc_model.config.id2label = {
+                id: label for label, id in config.label2id.items()
+            }
         # elif args.task_name is not None and not is_regression:
         #     model.config.label2id = {l: i for i, l in enumerate(label_list)}
         #     model.config.id2label = {id: label for label, id in config.label2id.items()}
@@ -641,7 +664,7 @@ def main():
                         completed_steps += 1
                         continue
                 outputs = model(**batch)
-                loss = outputs.loss
+                loss = outputs[0]
                 # We keep track of the loss at each epoch
                 if args.with_tracking:
                     total_loss += loss.detach().float()
@@ -673,13 +696,9 @@ def main():
         for step, batch in enumerate(eval_dataloader):
             with torch.no_grad():
                 outputs = model(**batch)
-            predictions = (
-                outputs.logits.argmax(dim=-1)
-                if not is_regression
-                else outputs.logits.squeeze()
-            )
+            predictions = outputs[1].argmax(dim=-1)
             predictions, references = accelerator.gather((predictions, batch["labels"]))
-            eval_loss += outputs.loss.item()
+            eval_loss += outputs[0].item()
             # If we are in a multiprocess environment, the last batch has duplicates
             if accelerator.num_processes > 1:
                 if step == len(eval_dataloader) - 1:
