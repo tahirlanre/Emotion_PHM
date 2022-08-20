@@ -561,7 +561,7 @@ def main():
         # if args.task_name is not None:
         #     metric = evaluate.load("glue", args.task_name)
         # else:
-        metric = evaluate.combine(["accuracy", "f1", "precision", "recall"])
+        metric = evaluate.load("f1")
 
         # Train!
         total_batch_size = (
