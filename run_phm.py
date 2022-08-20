@@ -14,6 +14,7 @@
 # limitations under the License.
 """ Finetuning a 🤗 Transformers model for sequence classification on GLUE."""
 import argparse
+import collections
 import json
 import logging
 import math
@@ -46,7 +47,7 @@ from transformers import (
 from transformers.utils import get_full_repo_name, send_example_telemetry
 from transformers.utils.versions import require_version
 
-from models.model import BERT_MTL, BERT_MTL_ATTN, BERT_STL
+from models import BERT_MTL, BERT_MTL_ATTN, BERT_STL
 
 
 logger = get_logger(__name__)
@@ -449,51 +450,12 @@ def main():
                 num_labels,
             )
 
-        # Preprocessing the datasets
-        # if args.task_name is not None:
-        #     sentence1_key, sentence2_key = task_to_keys[args.task_name]
-        # else:
-        #     # Again, we try to have some nice defaults but don't hesitate to tweak to your use case.
-        #     non_label_column_names = [name for name in raw_datasets["train"].column_names if name != "label"]
-        #     if "sentence1" in non_label_column_names and "sentence2" in non_label_column_names:
-        #         sentence1_key, sentence2_key = "sentence1", "sentence2"
-        #     else:
-        #         if len(non_label_column_names) >= 2:
-        #             sentence1_key, sentence2_key = non_label_column_names[:2]
-        #         else:
-        #             sentence1_key, sentence2_key = non_label_column_names[0], None
-
         # Some models have set the order of the labels to use, so let's make sure we do use it.
-        # label_to_id = None
-        # if (
-        #     model.config.label2id != PretrainedConfig(num_labels=num_labels).label2id
-        #     and args.task_name is not None
-        #     and not is_regression
-        # ):
-        #     # Some have all caps in their config, some don't.
-        #     label_name_to_id = {k.lower(): v for k, v in model.config.label2id.items()}
-        #     if list(sorted(label_name_to_id.keys())) == list(sorted(label_list)):
-        #         logger.info(
-        #             f"The configuration of the model provided the following label correspondence: {label_name_to_id}. "
-        #             "Using it!"
-        #         )
-        #         label_to_id = {i: label_name_to_id[label_list[i]] for i in range(num_labels)}
-        #     else:
-        #         logger.warning(
-        #             "Your model seems to have been trained with labels, but they don't match the dataset: ",
-        #             f"model labels: {list(sorted(label_name_to_id.keys()))}, dataset labels: {list(sorted(label_list))}."
-        #             "\nIgnoring the model labels as a result.",
-        #         )
-        # elif args.task_name is None and not is_regression:
-
-        if label_to_id is not None:
-            model.enc_model.config.label2id = label_to_id
+        if label_list:
+            model.enc_model.config.label2id = {l: i for i, l in enumerate(label_list)}
             model.enc_model.config.id2label = {
                 id: label for label, id in config.label2id.items()
             }
-        # elif args.task_name is not None and not is_regression:
-        #     model.config.label2id = {l: i for i, l in enumerate(label_list)}
-        #     model.config.id2label = {id: label for label, id in config.label2id.items()}
 
         train_dataset = processed_datasets["train"].select(train_ids)
         eval_dataset = processed_datasets["train"].select(test_ids)
@@ -599,7 +561,7 @@ def main():
         # if args.task_name is not None:
         #     metric = evaluate.load("glue", args.task_name)
         # else:
-        metric = evaluate.load("f1")
+        metric = evaluate.combine(["accuracy", "f1", "precision", "recall"])
 
         # Train!
         total_batch_size = (
@@ -751,11 +713,12 @@ def main():
     # Print fold results
     print(f"K-FOLD CROSS VALIDATION RESULTS FOR {k_folds} FOLDS")
     print("--------------------------------")
-    sum = 0.0
-    for key, value in results.items():
-        print(f"Fold {key}: {value} %")
-        sum += value["f1"]
-    print(f"Average: {sum/len(results.items())} %")
+    counter = collections.Counter()
+    for key, result in results.items():
+        print(f"Fold {key}: {result} %")
+        counter.update(result)
+    sum = dict(counter)
+    print(f"Average: {({key: value / len(results) for key, value in sum.items()})} %")
 
 
 if __name__ == "__main__":
