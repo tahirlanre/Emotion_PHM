@@ -47,7 +47,7 @@ from transformers import (
 from transformers.utils import get_full_repo_name, send_example_telemetry
 from transformers.utils.versions import require_version
 
-from models import BERT_MTL, BERT_MTL_ATTN, BERT_STL
+from models import BERT_MTL, BERT_MTL_ATTN, BERT_STL, BERT_MTL_MAX
 
 
 logger = get_logger(__name__)
@@ -109,7 +109,7 @@ def parse_args():
     parser.add_argument(
         "--model",
         type=str,
-        choices=["mtl", "mtl_attn", "stl"],
+        choices=["mtl", "mtl_attn", "stl", "mtl_max"],
         required=True,
         help="the name of the model to use. some models may use different model args than others.",
     )
@@ -261,7 +261,7 @@ def parse_args():
             args.output_dir is not None
         ), "Need an `output_dir` to create a repo when `--push_to_hub` is passed."
 
-    if args.model == "mlp" or args.model == "mlp_attn":
+    if args.model == "mtl" or args.model == "mtl_attn" or args.model == "mtl_max":
         if args.emotion_model_name_or_path is None:
             raise ValueError("Need an emotion pre-trained model")
 
@@ -445,6 +445,12 @@ def main():
             )
         elif args.model == "mtl_attn":
             model = BERT_MTL_ATTN(
+                args.model_name_or_path,
+                args.emotion_model_name_or_path,
+                num_labels,
+            )
+        elif args.model == "mtl_max":
+            model = BERT_MTL_MAX(
                 args.model_name_or_path,
                 args.emotion_model_name_or_path,
                 num_labels,

@@ -144,6 +144,46 @@ class BERT_MTL(nn.Module):
         return ((loss,) + output) if loss is not None else output
 
 
+class BERT_MTL_MAX(nn.Module):
+    def __init__(
+        self, enc_model_path_or_name, emo_model_path_or_name, num_labels, dropout=0.2
+    ):
+        super().__init__()
+        self.fc = nn.Linear(768, num_labels)
+        self.dropout = nn.Dropout(dropout)
+        self.num_labels = num_labels
+        self.enc_model = AutoModel.from_pretrained(
+            enc_model_path_or_name, output_hidden_states=True
+        )
+        self.emo_model = AutoModel.from_pretrained(
+            emo_model_path_or_name, output_hidden_states=True
+        )
+        # self.attn_gate = AttnGating(self.enc_model.config.hidden_size, dropout)
+
+    def forward(self, input_ids, attention_mask=None, token_type_ids=None, labels=None):
+        enc_outputs = self.enc_model(input_ids, attention_mask=attention_mask)
+        embeds = enc_outputs[1]
+        embeds = self.dropout(embeds)
+
+        emo_outputs = self.emo_model(input_ids, attention_mask=attention_mask)
+        emo_embeds = emo_outputs[1]
+        emo_embeds = self.dropout(emo_embeds)
+
+        combined_embeds = torch.max(embeds, emo_embeds)
+
+        combined_embeds = self.dropout(combined_embeds)
+
+        logits = self.fc(combined_embeds)
+        loss = None
+        if labels is not None:
+            loss_fn = nn.CrossEntropyLoss()
+            loss = loss_fn(logits, labels)
+
+        output = (logits,)
+
+        return ((loss,) + output) if loss is not None else output
+
+
 class BERT_STL(nn.Module):
     def __init__(self, enc_model_name_or_path, num_labels, dropout=0.2) -> None:
         super().__init__()
