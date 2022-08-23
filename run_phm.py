@@ -27,24 +27,22 @@ from datasets import load_dataset
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 from sklearn.model_selection import KFold
+import wandb
 
 import evaluate
 import transformers
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import set_seed
-from huggingface_hub import Repository
 from transformers import (
     AutoConfig,
-    AutoModelForSequenceClassification,
     AutoTokenizer,
     DataCollatorWithPadding,
-    PretrainedConfig,
     SchedulerType,
     default_data_collator,
     get_scheduler,
 )
-from transformers.utils import get_full_repo_name, send_example_telemetry
+from transformers.utils import send_example_telemetry
 from transformers.utils.versions import require_version
 
 from models import BERT_MTL, BERT_MTL_ATTN, BERT_STL, BERT_MTL_MAX
@@ -133,7 +131,7 @@ def parse_args():
     parser.add_argument(
         "--learning_rate",
         type=float,
-        default=1e-5,
+        default=2e-5,
         help="Initial learning rate (after the potential warmup period) to use.",
     )
     parser.add_argument(
@@ -185,19 +183,6 @@ def parse_args():
     )
     parser.add_argument(
         "--k_folds", type=int, default=5, help="Number of folds for cross validation"
-    )
-    parser.add_argument(
-        "--push_to_hub",
-        action="store_true",
-        help="Whether or not to push the model to the Hub.",
-    )
-    parser.add_argument(
-        "--hub_model_id",
-        type=str,
-        help="The name of the repository to keep in sync with the local `output_dir`.",
-    )
-    parser.add_argument(
-        "--hub_token", type=str, help="The token to use to push to the Model Hub."
     )
     parser.add_argument(
         "--checkpointing_steps",
@@ -256,11 +241,6 @@ def parse_args():
             "json",
         ], "`test_file` should be a csv or a json file."
 
-    if args.push_to_hub:
-        assert (
-            args.output_dir is not None
-        ), "Need an `output_dir` to create a repo when `--push_to_hub` is passed."
-
     if args.model == "mtl" or args.model == "mtl_attn" or args.model == "mtl_max":
         if args.emotion_model_name_or_path is None:
             raise ValueError("Need an emotion pre-trained model")
@@ -300,25 +280,11 @@ def main():
     if args.seed is not None:
         set_seed(args.seed)
 
-    # Handle the repository creation
-    if accelerator.is_main_process:
-        if args.push_to_hub:
-            if args.hub_model_id is None:
-                repo_name = get_full_repo_name(
-                    Path(args.output_dir).name, token=args.hub_token
-                )
-            else:
-                repo_name = args.hub_model_id
-            repo = Repository(args.output_dir, clone_from=repo_name)
-
-            with open(os.path.join(args.output_dir, ".gitignore"), "w+") as gitignore:
-                if "step_*" not in gitignore:
-                    gitignore.write("step_*\n")
-                if "epoch_*" not in gitignore:
-                    gitignore.write("epoch_*\n")
-        elif args.output_dir is not None:
-            os.makedirs(args.output_dir, exist_ok=True)
     accelerator.wait_for_everyone()
+
+    # set up wandb to track metrics
+    wandb.login()
+    wandb.init(project="phm-classification", config=args)
 
     # Get the datasets: you can either provide your own CSV/JSON training and evaluation files (see below)
     # or specify a GLUE benchmark task (the dataset will be downloaded automatically from the datasets Hub).
@@ -551,18 +517,6 @@ def main():
         else:
             checkpointing_steps = None
 
-        # We need to initialize the trackers we use, and also store our configuration.
-        # We initialize the trackers only on main process because `accelerator.log`
-        # only logs on main process and we don't want empty logs/runs on other processes.
-        if args.with_tracking:
-            if accelerator.is_main_process:
-                experiment_config = vars(args)
-                # TensorBoard cannot log Enums, need the raw value
-                experiment_config["lr_scheduler_type"] = experiment_config[
-                    "lr_scheduler_type"
-                ].value
-                accelerator.init_trackers("glue_no_trainer", experiment_config)
-
         # Get the metric function
         # if args.task_name is not None:
         #     metric = evaluate.load("glue", args.task_name)
@@ -707,10 +661,6 @@ def main():
             )
             if accelerator.is_main_process:
                 tokenizer.save_pretrained(args.output_dir)
-                if args.push_to_hub:
-                    repo.push_to_hub(
-                        commit_message="End of training", auto_lfs_prune=True
-                    )
 
         if args.output_dir is not None:
             with open(os.path.join(args.output_dir, "all_results.json"), "w") as f:
