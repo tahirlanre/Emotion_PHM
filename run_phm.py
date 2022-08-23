@@ -15,6 +15,7 @@
 """ Finetuning a 🤗 Transformers model for sequence classification on GLUE."""
 import argparse
 import collections
+import copy
 import json
 import logging
 import math
@@ -46,7 +47,6 @@ from transformers.utils import send_example_telemetry
 from transformers.utils.versions import require_version
 
 from models import BERT_MTL, BERT_MTL_ATTN, BERT_STL, BERT_MTL_MAX
-
 
 logger = get_logger(__name__)
 
@@ -271,7 +271,7 @@ def main():
     logger.info(accelerator.state, main_process_only=False)
     if accelerator.is_local_main_process:
         datasets.utils.logging.set_verbosity_warning()
-        transformers.utils.logging.set_verbosity_info()
+        transformers.utils.logging.set_verbosity_warning()
     else:
         datasets.utils.logging.set_verbosity_error()
         transformers.utils.logging.set_verbosity_error()
@@ -340,7 +340,8 @@ def main():
     results = {}
 
     # Define the K-fold Cross Validator
-    kfold = KFold(n_splits=k_folds, shuffle=True)
+    inner_fold = KFold(n_splits=k_folds, shuffle=True, random_state=100)
+    outer_fold = KFold(n_splits=3, shuffle=True, random_state=100)
 
     config = AutoConfig.from_pretrained(
         args.model_name_or_path, num_labels=num_labels
@@ -388,240 +389,267 @@ def main():
             desc="Running tokenizer on dataset",
         )
 
-    for fold, (train_ids, test_ids) in enumerate(
-        kfold.split(processed_datasets["train"])
+    for outer_fold_count, (train_ids, test_ids) in enumerate(
+        outer_fold.split(processed_datasets["train"])
     ):
-
-        # Load pretrained model and tokenizer
-        #
-        # In distributed training, the .from_pretrained methods guarantee that only one local process can concurrently
-        # download model & vocab.
-        if args.model == "stl":
-            model = BERT_STL(
-                args.model_name_or_path,
-                num_labels,
-                # args.dropout,
-            )
-        elif args.model == "mtl":
-            model = BERT_MTL(
-                args.model_name_or_path,
-                args.emotion_model_name_or_path,
-                num_labels,
-                # args.dropout,
-            )
-        elif args.model == "mtl_attn":
-            model = BERT_MTL_ATTN(
-                args.model_name_or_path,
-                args.emotion_model_name_or_path,
-                num_labels,
-            )
-        elif args.model == "mtl_max":
-            model = BERT_MTL_MAX(
-                args.model_name_or_path,
-                args.emotion_model_name_or_path,
-                num_labels,
-            )
-
-        # Some models have set the order of the labels to use, so let's make sure we do use it.
-        if label_list:
-            model.enc_model.config.label2id = {l: i for i, l in enumerate(label_list)}
-            model.enc_model.config.id2label = {
-                id: label for label, id in config.label2id.items()
-            }
-
+        logger.info(f"outter fold {outer_fold_count}")
         train_dataset = processed_datasets["train"].select(train_ids)
-        eval_dataset = processed_datasets["train"].select(test_ids)
-        # test_dataset = processed_datasets["test"]
+        test_dataset = processed_datasets["train"].select(test_ids)
 
-        train_dataloader = DataLoader(
-            train_dataset,
-            shuffle=True,
-            collate_fn=data_collator,
-            batch_size=args.per_device_train_batch_size,
-        )
-        eval_dataloader = DataLoader(
-            eval_dataset,
+        best_model = None
+        best_eval_loss = float("inf")
+        for inner_fold_count, (sub_train_ids, eval_ids) in enumerate(
+            inner_fold.split(range(train_dataset.num_rows))
+        ):
+            logger.info(f"inner fold {inner_fold_count}")
+
+            if args.model == "stl":
+                model = BERT_STL(
+                    args.model_name_or_path,
+                    num_labels,
+                    # args.dropout,
+                )
+            elif args.model == "mtl":
+                model = BERT_MTL(
+                    args.model_name_or_path,
+                    args.emotion_model_name_or_path,
+                    num_labels,
+                    # args.dropout,
+                )
+            elif args.model == "mtl_attn":
+                model = BERT_MTL_ATTN(
+                    args.model_name_or_path,
+                    args.emotion_model_name_or_path,
+                    num_labels,
+                )
+            elif args.model == "mtl_max":
+                model = BERT_MTL_MAX(
+                    args.model_name_or_path,
+                    args.emotion_model_name_or_path,
+                    num_labels,
+                )
+
+            # Some models have set the order of the labels to use, so let's make sure we do use it.
+            if label_list:
+                model.enc_model.config.label2id = {
+                    l: i for i, l in enumerate(label_list)
+                }
+                model.enc_model.config.id2label = {
+                    id: label for label, id in config.label2id.items()
+                }
+
+            sub_train_dataset = train_dataset.select(sub_train_ids)
+            eval_dataset = train_dataset.select(eval_ids)
+
+            train_dataloader = DataLoader(
+                sub_train_dataset,
+                shuffle=True,
+                collate_fn=data_collator,
+                batch_size=args.per_device_train_batch_size,
+            )
+            eval_dataloader = DataLoader(
+                eval_dataset,
+                collate_fn=data_collator,
+                batch_size=args.per_device_eval_batch_size,
+            )
+
+            # Optimizer
+            # Split weights in two groups, one with weight decay and the other not.
+            no_decay = ["bias", "LayerNorm.weight"]
+            optimizer_grouped_parameters = [
+                {
+                    "params": [
+                        p
+                        for n, p in model.named_parameters()
+                        if not any(nd in n for nd in no_decay)
+                    ],
+                    "weight_decay": args.weight_decay,
+                },
+                {
+                    "params": [
+                        p
+                        for n, p in model.named_parameters()
+                        if any(nd in n for nd in no_decay)
+                    ],
+                    "weight_decay": 0.0,
+                },
+            ]
+            optimizer = torch.optim.AdamW(
+                optimizer_grouped_parameters, lr=args.learning_rate
+            )
+
+            # Scheduler and math around the number of training steps.
+            overrode_max_train_steps = False
+            num_update_steps_per_epoch = math.ceil(
+                len(train_dataloader) / args.gradient_accumulation_steps
+            )
+            if args.max_train_steps is None:
+                args.max_train_steps = (
+                    args.num_train_epochs * num_update_steps_per_epoch
+                )
+                overrode_max_train_steps = True
+
+            lr_scheduler = get_scheduler(
+                name=args.lr_scheduler_type,
+                optimizer=optimizer,
+                num_warmup_steps=args.num_warmup_steps,
+                num_training_steps=args.max_train_steps,
+            )
+
+            # Prepare everything with our `accelerator`.
+            (
+                model,
+                optimizer,
+                train_dataloader,
+                eval_dataloader,
+                lr_scheduler,
+            ) = accelerator.prepare(
+                model, optimizer, train_dataloader, eval_dataloader, lr_scheduler
+            )
+
+            # We need to recalculate our total training steps as the size of the training dataloader may have changed
+            num_update_steps_per_epoch = math.ceil(
+                len(train_dataloader) / args.gradient_accumulation_steps
+            )
+            if overrode_max_train_steps:
+                args.max_train_steps = (
+                    args.num_train_epochs * num_update_steps_per_epoch
+                )
+            # Afterwards we recalculate our number of training epochs
+            args.num_train_epochs = math.ceil(
+                args.max_train_steps / num_update_steps_per_epoch
+            )
+
+            # Figure out how many steps we should save the Accelerator states
+            if hasattr(args.checkpointing_steps, "isdigit"):
+                checkpointing_steps = args.checkpointing_steps
+                if args.checkpointing_steps.isdigit():
+                    checkpointing_steps = int(args.checkpointing_steps)
+            else:
+                checkpointing_steps = None
+
+            # Get the metric function
+            # if args.task_name is not None:
+            #     metric = evaluate.load("glue", args.task_name)
+            # else:
+            metric = evaluate.load("f1")
+
+            # Train!
+            total_batch_size = (
+                args.per_device_train_batch_size
+                * accelerator.num_processes
+                * args.gradient_accumulation_steps
+            )
+
+            # logger.info("***** Running training *****")
+            # logger.info(f"  Fold = {fold}")
+            # logger.info(f"  Num examples = {len(train_dataset)}")
+            # logger.info(f"  Num Epochs = {args.num_train_epochs}")
+            # logger.info(
+            #     f"  Instantaneous batch size per device = {args.per_device_train_batch_size}"
+            # )
+            # logger.info(
+            #     f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}"
+            # )
+            # logger.info(
+            #     f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}"
+            # )
+            # logger.info(f"  Total optimization steps = {args.max_train_steps}")
+            # Only show the progress bar once on each machine.
+            progress_bar = tqdm(
+                range(args.max_train_steps),
+                disable=not accelerator.is_local_main_process,
+            )
+            completed_steps = 0
+            starting_epoch = 0
+            # Potentially load in the weights and states from a previous save
+
+            for epoch in range(starting_epoch, args.num_train_epochs):
+                model.train()
+
+                train_loss = 0
+                eval_loss = 0
+
+                # if args.with_tracking:
+                #     total_loss = 0
+                for step, batch in enumerate(train_dataloader):
+                    outputs = model(**batch)
+                    loss = outputs[0]
+                    # We keep track of the loss at each epoch
+                    # if args.with_tracking:
+                    #     total_loss += loss.detach().float()
+                    train_loss += loss.detach().float()
+                    loss = loss / args.gradient_accumulation_steps
+                    accelerator.backward(loss)
+                    if (
+                        step % args.gradient_accumulation_steps == 0
+                        or step == len(train_dataloader) - 1
+                    ):
+                        optimizer.step()
+                        lr_scheduler.step()
+                        optimizer.zero_grad()
+                        progress_bar.update(1)
+                        completed_steps += 1
+
+                    if isinstance(checkpointing_steps, int):
+                        if completed_steps % checkpointing_steps == 0:
+                            output_dir = f"step_{completed_steps }"
+                            if args.output_dir is not None:
+                                output_dir = os.path.join(args.output_dir, output_dir)
+                            accelerator.save_state(output_dir)
+
+                    if completed_steps >= args.max_train_steps:
+                        break
+
+                train_loss = train_loss / len(train_dataloader)
+                logger.info(f"epoch {epoch}: train loss: {train_loss}")
+
+                model.eval()
+                samples_seen = 0
+                eval_loss = 0.0
+                for step, batch in enumerate(eval_dataloader):
+                    with torch.no_grad():
+                        outputs = model(**batch)
+                    predictions = outputs[1].argmax(dim=-1)
+                    predictions, references = accelerator.gather(
+                        (predictions, batch["labels"])
+                    )
+                    eval_loss += outputs[0].item()
+
+                eval_loss = eval_loss / len(eval_dataloader)
+
+                if eval_loss < best_eval_loss:
+                    best_eval_loss = eval_loss
+                    best_model = copy.deepcopy(model)
+
+                logger.info(f"epoch {epoch}: eval loss: {eval_loss}")
+                # results[fold] = eval_metric
+
+                # if args.output_dir is not None:
+                #     accelerator.wait_for_everyone()
+                #     unwrapped_model = accelerator.unwrap_model(model)
+                #     unwrapped_model.save_pretrained(
+                #         args.output_dir,
+                #         is_main_process=accelerator.is_main_process,
+                #         save_function=accelerator.save,
+                #     )
+                #     if accelerator.is_main_process:
+                #         tokenizer.save_pretrained(args.output_dir)
+
+                # if args.output_dir is not None:
+                #     with open(os.path.join(args.output_dir, "all_results.json"), "w") as f:
+                #         json.dump({"eval_accuracy": eval_metric["accuracy"]}, f)
+
+        test_dataloader = DataLoader(
+            test_dataset,
             collate_fn=data_collator,
             batch_size=args.per_device_eval_batch_size,
         )
-        # test_dataloader = DataLoader(test_dataset, collate_fn=data_collator, batch_size=args.per_device_eval_batch_size)
+        best_model, test_dataloader = accelerator.prepare(best_model, test_dataloader)
 
-        # Optimizer
-        # Split weights in two groups, one with weight decay and the other not.
-        no_decay = ["bias", "LayerNorm.weight"]
-        optimizer_grouped_parameters = [
-            {
-                "params": [
-                    p
-                    for n, p in model.named_parameters()
-                    if not any(nd in n for nd in no_decay)
-                ],
-                "weight_decay": args.weight_decay,
-            },
-            {
-                "params": [
-                    p
-                    for n, p in model.named_parameters()
-                    if any(nd in n for nd in no_decay)
-                ],
-                "weight_decay": 0.0,
-            },
-        ]
-        optimizer = torch.optim.AdamW(
-            optimizer_grouped_parameters, lr=args.learning_rate
-        )
-
-        # Scheduler and math around the number of training steps.
-        overrode_max_train_steps = False
-        num_update_steps_per_epoch = math.ceil(
-            len(train_dataloader) / args.gradient_accumulation_steps
-        )
-        if args.max_train_steps is None:
-            args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
-            overrode_max_train_steps = True
-
-        lr_scheduler = get_scheduler(
-            name=args.lr_scheduler_type,
-            optimizer=optimizer,
-            num_warmup_steps=args.num_warmup_steps,
-            num_training_steps=args.max_train_steps,
-        )
-
-        # Prepare everything with our `accelerator`.
-        (
-            model,
-            optimizer,
-            train_dataloader,
-            eval_dataloader,
-            lr_scheduler,
-        ) = accelerator.prepare(
-            model, optimizer, train_dataloader, eval_dataloader, lr_scheduler
-        )
-
-        # We need to recalculate our total training steps as the size of the training dataloader may have changed
-        num_update_steps_per_epoch = math.ceil(
-            len(train_dataloader) / args.gradient_accumulation_steps
-        )
-        if overrode_max_train_steps:
-            args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
-        # Afterwards we recalculate our number of training epochs
-        args.num_train_epochs = math.ceil(
-            args.max_train_steps / num_update_steps_per_epoch
-        )
-
-        # Figure out how many steps we should save the Accelerator states
-        if hasattr(args.checkpointing_steps, "isdigit"):
-            checkpointing_steps = args.checkpointing_steps
-            if args.checkpointing_steps.isdigit():
-                checkpointing_steps = int(args.checkpointing_steps)
-        else:
-            checkpointing_steps = None
-
-        # Get the metric function
-        # if args.task_name is not None:
-        #     metric = evaluate.load("glue", args.task_name)
-        # else:
-        metric = evaluate.load("f1")
-
-        # Train!
-        total_batch_size = (
-            args.per_device_train_batch_size
-            * accelerator.num_processes
-            * args.gradient_accumulation_steps
-        )
-
-        logger.info("***** Running training *****")
-        logger.info(f"  Fold = {fold}")
-        logger.info(f"  Num examples = {len(train_dataset)}")
-        logger.info(f"  Num Epochs = {args.num_train_epochs}")
-        logger.info(
-            f"  Instantaneous batch size per device = {args.per_device_train_batch_size}"
-        )
-        logger.info(
-            f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}"
-        )
-        logger.info(
-            f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}"
-        )
-        logger.info(f"  Total optimization steps = {args.max_train_steps}")
-        # Only show the progress bar once on each machine.
-        progress_bar = tqdm(
-            range(args.max_train_steps), disable=not accelerator.is_local_main_process
-        )
-        completed_steps = 0
-        starting_epoch = 0
-        # Potentially load in the weights and states from a previous save
-        if args.resume_from_checkpoint:
-            if (
-                args.resume_from_checkpoint is not None
-                or args.resume_from_checkpoint != ""
-            ):
-                accelerator.print(
-                    f"Resumed from checkpoint: {args.resume_from_checkpoint}"
-                )
-                accelerator.load_state(args.resume_from_checkpoint)
-                path = os.path.basename(args.resume_from_checkpoint)
-            else:
-                # Get the most recent checkpoint
-                dirs = [f.name for f in os.scandir(os.getcwd()) if f.is_dir()]
-                dirs.sort(key=os.path.getctime)
-                path = dirs[
-                    -1
-                ]  # Sorts folders by date modified, most recent checkpoint is the last
-            # Extract `epoch_{i}` or `step_{i}`
-            training_difference = os.path.splitext(path)[0]
-
-            if "epoch" in training_difference:
-                starting_epoch = int(training_difference.replace("epoch_", "")) + 1
-                resume_step = None
-            else:
-                resume_step = int(training_difference.replace("step_", ""))
-                starting_epoch = resume_step // len(train_dataloader)
-                resume_step -= starting_epoch * len(train_dataloader)
-
-        # best_model = None
-        # best_eval_loss = float("inf")
-        for epoch in range(starting_epoch, args.num_train_epochs):
-            model.train()
-            if args.with_tracking:
-                total_loss = 0
-            for step, batch in enumerate(train_dataloader):
-                # We need to skip steps until we reach the resumed step
-                if args.resume_from_checkpoint and epoch == starting_epoch:
-                    if resume_step is not None and step < resume_step:
-                        completed_steps += 1
-                        continue
-                outputs = model(**batch)
-                loss = outputs[0]
-                # We keep track of the loss at each epoch
-                if args.with_tracking:
-                    total_loss += loss.detach().float()
-                loss = loss / args.gradient_accumulation_steps
-                accelerator.backward(loss)
-                if (
-                    step % args.gradient_accumulation_steps == 0
-                    or step == len(train_dataloader) - 1
-                ):
-                    optimizer.step()
-                    lr_scheduler.step()
-                    optimizer.zero_grad()
-                    progress_bar.update(1)
-                    completed_steps += 1
-
-                if isinstance(checkpointing_steps, int):
-                    if completed_steps % checkpointing_steps == 0:
-                        output_dir = f"step_{completed_steps }"
-                        if args.output_dir is not None:
-                            output_dir = os.path.join(args.output_dir, output_dir)
-                        accelerator.save_state(output_dir)
-
-                if completed_steps >= args.max_train_steps:
-                    break
-
-        model.eval()
-        samples_seen = 0
-        eval_loss = 0.0
-        for step, batch in enumerate(eval_dataloader):
+        # best_model = best_model.to("cuda")
+        best_model.eval()
+        for step, batch in enumerate(test_dataloader):
             with torch.no_grad():
                 outputs = model(**batch)
             predictions = outputs[1].argmax(dim=-1)
@@ -629,12 +657,12 @@ def main():
             eval_loss += outputs[0].item()
             # If we are in a multiprocess environment, the last batch has duplicates
             if accelerator.num_processes > 1:
-                if step == len(eval_dataloader) - 1:
+                if step == len(test_dataloader) - 1:
                     predictions = predictions[
-                        : len(eval_dataloader.dataset) - samples_seen
+                        : len(test_dataloader.dataset) - samples_seen
                     ]
                     references = references[
-                        : len(eval_dataloader.dataset) - samples_seen
+                        : len(test_dataloader.dataset) - samples_seen
                     ]
                 else:
                     samples_seen += references.shape[0]
@@ -643,38 +671,25 @@ def main():
                 references=references,
             )
 
-        eval_loss = eval_loss / len(eval_dataloader)
-        eval_metric = metric.compute(average="macro")
+        test_metric = metric.compute(average="macro")
         # Print accuracy
-        logger.info(f"Eval metric for fold {fold}: {eval_metric}")
         logger.info("--------------------------------")
-        logger.info(f"epoch {epoch}: {eval_metric}, eval loss: {eval_loss}")
-        results[fold] = eval_metric
-
-        if args.output_dir is not None:
-            accelerator.wait_for_everyone()
-            unwrapped_model = accelerator.unwrap_model(model)
-            unwrapped_model.save_pretrained(
-                args.output_dir,
-                is_main_process=accelerator.is_main_process,
-                save_function=accelerator.save,
-            )
-            if accelerator.is_main_process:
-                tokenizer.save_pretrained(args.output_dir)
-
-        if args.output_dir is not None:
-            with open(os.path.join(args.output_dir, "all_results.json"), "w") as f:
-                json.dump({"eval_accuracy": eval_metric["accuracy"]}, f)
+        logger.info(f"Test metric for fold {outer_fold_count}: {test_metric}")
+        logger.info("--------------------------------")
+        results[outer_fold_count] = test_metric
 
     # Print fold results
-    print(f"K-FOLD CROSS VALIDATION RESULTS FOR {k_folds} FOLDS")
-    print("--------------------------------")
+    logger.info("--------------------------------")
+    logger.info(f"K-FOLD CROSS VALIDATION RESULTS FOR {k_folds} FOLDS")
+    logger.info("--------------------------------")
     counter = collections.Counter()
     for key, result in results.items():
-        print(f"Fold {key}: {result} %")
+        logger.info(f"Fold {key}: {result} %")
         counter.update(result)
     sum = dict(counter)
-    print(f"Average: {({key: value / len(results) for key, value in sum.items()})} %")
+    logger.info(
+        f"Average: {({key: value / len(results) for key, value in sum.items()})} %"
+    )
 
 
 if __name__ == "__main__":
