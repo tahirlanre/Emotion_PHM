@@ -15,6 +15,7 @@
 """ Finetuning a 🤗 Transformers model for sequence classification on GLUE."""
 import argparse
 import collections
+import copy
 import json
 import logging
 import math
@@ -27,7 +28,6 @@ from datasets import load_dataset
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 from sklearn.model_selection import KFold
-import wandb
 
 import evaluate
 import transformers
@@ -271,7 +271,7 @@ def main():
     logger.info(accelerator.state, main_process_only=False)
     if accelerator.is_local_main_process:
         datasets.utils.logging.set_verbosity_warning()
-        transformers.utils.logging.set_verbosity_info()
+        transformers.utils.logging.set_verbosity_warning()
     else:
         datasets.utils.logging.set_verbosity_error()
         transformers.utils.logging.set_verbosity_error()
@@ -283,8 +283,8 @@ def main():
     accelerator.wait_for_everyone()
 
     # set up wandb to track metrics
-    wandb.login()
-    wandb.init(project="phm-classification", config=args)
+    # wandb.login()
+    # wandb.init(project="phm-classification", config=args)
 
     # Get the datasets: you can either provide your own CSV/JSON training and evaluation files (see below)
     # or specify a GLUE benchmark task (the dataset will be downloaded automatically from the datasets Hub).
@@ -430,21 +430,25 @@ def main():
             }
 
         train_dataset = processed_datasets["train"].select(train_ids)
-        eval_dataset = processed_datasets["train"].select(test_ids)
-        # test_dataset = processed_datasets["test"]
+        train_eval_dataset = train_dataset.train_test_split(test_size=0.1)
+        test_dataset = processed_datasets["train"].select(test_ids)
 
         train_dataloader = DataLoader(
-            train_dataset,
+            train_eval_dataset["train"],
             shuffle=True,
             collate_fn=data_collator,
             batch_size=args.per_device_train_batch_size,
         )
         eval_dataloader = DataLoader(
-            eval_dataset,
+            train_eval_dataset["test"],
             collate_fn=data_collator,
             batch_size=args.per_device_eval_batch_size,
         )
-        # test_dataloader = DataLoader(test_dataset, collate_fn=data_collator, batch_size=args.per_device_eval_batch_size)
+        test_dataloader = DataLoader(
+            test_dataset,
+            collate_fn=data_collator,
+            batch_size=args.per_device_eval_batch_size,
+        )
 
         # Optimizer
         # Split weights in two groups, one with weight decay and the other not.
@@ -531,19 +535,19 @@ def main():
         )
 
         logger.info("***** Running training *****")
-        logger.info(f"  Fold = {fold}")
-        logger.info(f"  Num examples = {len(train_dataset)}")
-        logger.info(f"  Num Epochs = {args.num_train_epochs}")
-        logger.info(
-            f"  Instantaneous batch size per device = {args.per_device_train_batch_size}"
-        )
-        logger.info(
-            f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}"
-        )
-        logger.info(
-            f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}"
-        )
-        logger.info(f"  Total optimization steps = {args.max_train_steps}")
+        # logger.info(f"  Fold = {fold}")
+        # logger.info(f"  Num examples = {len(sub_train_dataset)}")
+        # logger.info(f"  Num Epochs = {args.num_train_epochs}")
+        # logger.info(
+        #     f"  Instantaneous batch size per device = {args.per_device_train_batch_size}"
+        # )
+        # logger.info(
+        #     f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}"
+        # )
+        # logger.info(
+        #     f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}"
+        # )
+        # logger.info(f"  Total optimization steps = {args.max_train_steps}")
         # Only show the progress bar once on each machine.
         progress_bar = tqdm(
             range(args.max_train_steps), disable=not accelerator.is_local_main_process
@@ -579,8 +583,8 @@ def main():
                 starting_epoch = resume_step // len(train_dataloader)
                 resume_step -= starting_epoch * len(train_dataloader)
 
-        # best_model = None
-        # best_eval_loss = float("inf")
+        best_model = None
+        best_eval_loss = float("inf")
         for epoch in range(starting_epoch, args.num_train_epochs):
             model.train()
             if args.with_tracking:
@@ -618,23 +622,40 @@ def main():
                 if completed_steps >= args.max_train_steps:
                     break
 
-        model.eval()
-        samples_seen = 0
-        eval_loss = 0.0
-        for step, batch in enumerate(eval_dataloader):
+            model.eval()
+            samples_seen = 0
+            eval_loss = 0.0
+            for step, batch in enumerate(eval_dataloader):
+                with torch.no_grad():
+                    outputs = model(**batch)
+                predictions = outputs[1].argmax(dim=-1)
+                predictions, references = accelerator.gather(
+                    (predictions, batch["labels"])
+                )
+                eval_loss += outputs[0].item()
+            eval_loss = eval_loss / len(eval_dataloader)
+            logger.info(f"epoch {epoch}: eval loss: {eval_loss}")
+
+            if eval_loss < best_eval_loss:
+                best_eval_loss = eval_loss
+                best_model = copy.deepcopy(model)
+
+        # evaluate best model on test data
+        best_model, test_dataloader = accelerator.prepare(best_model, test_dataloader)
+        best_model.eval()
+        for step, batch in enumerate(test_dataloader):
             with torch.no_grad():
                 outputs = model(**batch)
             predictions = outputs[1].argmax(dim=-1)
             predictions, references = accelerator.gather((predictions, batch["labels"]))
-            eval_loss += outputs[0].item()
             # If we are in a multiprocess environment, the last batch has duplicates
             if accelerator.num_processes > 1:
-                if step == len(eval_dataloader) - 1:
+                if step == len(test_dataloader) - 1:
                     predictions = predictions[
-                        : len(eval_dataloader.dataset) - samples_seen
+                        : len(test_dataloader.dataset) - samples_seen
                     ]
                     references = references[
-                        : len(eval_dataloader.dataset) - samples_seen
+                        : len(test_dataloader.dataset) - samples_seen
                     ]
                 else:
                     samples_seen += references.shape[0]
@@ -643,13 +664,15 @@ def main():
                 references=references,
             )
 
-        eval_loss = eval_loss / len(eval_dataloader)
-        eval_metric = metric.compute(average="macro")
-        # Print accuracy
-        logger.info(f"Eval metric for fold {fold}: {eval_metric}")
+        # logger.info(f"epoch {epoch}: eval loss: {eval_loss}")
+        test_metric = metric.compute(average="macro")
+
+        # Print metric
         logger.info("--------------------------------")
-        logger.info(f"epoch {epoch}: {eval_metric}, eval loss: {eval_loss}")
-        results[fold] = eval_metric
+        logger.info(f"Eval metric for fold {fold}: {test_metric}")
+        logger.info("--------------------------------")
+
+        results[fold] = test_metric
 
         if args.output_dir is not None:
             accelerator.wait_for_everyone()
@@ -664,7 +687,7 @@ def main():
 
         if args.output_dir is not None:
             with open(os.path.join(args.output_dir, "all_results.json"), "w") as f:
-                json.dump({"eval_accuracy": eval_metric["accuracy"]}, f)
+                json.dump({"eval_f1": test_metric["f1"]}, f)
 
     # Print fold results
     print(f"K-FOLD CROSS VALIDATION RESULTS FOR {k_folds} FOLDS")
