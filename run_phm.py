@@ -179,12 +179,6 @@ def parse_args():
         "--output_dir", type=str, default=None, help="Where to store the final model."
     )
     parser.add_argument(
-        "--seed", type=int, default=42, help="A seed for reproducible training."
-    )
-    parser.add_argument(
-        "--k_folds", type=int, default=5, help="Number of folds for cross validation"
-    )
-    parser.add_argument(
         "--checkpointing_steps",
         type=str,
         default=None,
@@ -276,126 +270,66 @@ def main():
         datasets.utils.logging.set_verbosity_error()
         transformers.utils.logging.set_verbosity_error()
 
-    # If passed along, set the training seed now.
-    if args.seed is not None:
-        set_seed(args.seed)
-
-    accelerator.wait_for_everyone()
-
-    # set up wandb to track metrics
-    # wandb.login()
-    # wandb.init(project="phm-classification", config=args)
-
-    # Get the datasets: you can either provide your own CSV/JSON training and evaluation files (see below)
-    # or specify a GLUE benchmark task (the dataset will be downloaded automatically from the datasets Hub).
-
-    # For CSV/JSON files, this script will use as labels the column called 'label' and as pair of sentences the
-    # sentences in columns called 'sentence1' and 'sentence2' if such column exists or the first two columns not named
-    # label if at least two columns are provided.
-
-    # If the CSVs/JSONs contain only one non-label column, the script does single sentence classification on this
-    # single column. You can easily tweak this behavior (see below)
-
-    # In distributed training, the load_dataset function guarantee that only one local process can concurrently
-    # download the dataset.
-    # if args.task_name is not None:
-    #     # Downloading and loading a dataset from the hub.
-    #     raw_datasets = load_dataset("glue", args.task_name)
-    # else:
-    # Loading the dataset from local csv or json file.
-    data_files = {}
-    if args.train_file is not None:
-        data_files["train"] = args.train_file
-    if args.validation_file is not None:
-        data_files["validation"] = args.validation_file
-    if args.test_file is not None:
-        data_files["test"] = args.test_file
-    extension = (
-        args.train_file if args.train_file is not None else args.validation_file
-    ).split(".")[-1]
-    raw_datasets = load_dataset(extension, data_files=data_files)
-    # See more about loading any type of standard or custom dataset at
-    # https://huggingface.co/docs/datasets/loading_datasets.html.
-
-    # Labels
-    # if args.task_name is not None:
-    #     is_regression = args.task_name == "stsb"
-    #     if not is_regression:
-    #         label_list = raw_datasets["train"].features["label"].names
-    #         num_labels = len(label_list)
-    #     else:
-    #         num_labels = 1
-    # else:
-    # Trying to have good defaults here, don't hesitate to tweak to your needs.
-    # A useful fast method:
-    # https://huggingface.co/docs/datasets/package_reference/main_classes.html#datasets.Dataset.unique
-    label_list = raw_datasets["train"].unique("label")
-    label_list.sort()  # Let's sort it for determinism
-    num_labels = len(label_list)
-    label_to_id = {v: i for i, v in enumerate(label_list)}
-
-    k_folds = args.k_folds
-
-    # For fold results
+    # For seed results
     results = {}
 
-    # Define the K-fold Cross Validator
-    kfold = KFold(n_splits=k_folds, shuffle=True)
+    # list of seeds
+    seeds = [42, 52, 62, 72, 100]
+    for seed in seeds:
+        # set training seed
+        set_seed(seed)
 
-    config = AutoConfig.from_pretrained(
-        args.model_name_or_path, num_labels=num_labels
-    )  # finetuning_task=args.task_name)
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.model_name_or_path, use_fast=not args.use_slow_tokenizer
-    )
+        accelerator.wait_for_everyone()
+        # set up wandb to track metrics
+        # wandb.login()
+        # wandb.init(project="phm-classification", config=args)
 
-    # DataLoaders creation:
-    if args.pad_to_max_length:
-        # If padding was already done ot max length, we use the default data collator that will just convert everything
-        # to tensors.
-        data_collator = default_data_collator
-    else:
-        # Otherwise, `DataCollatorWithPadding` will apply dynamic padding for us (by padding to the maximum length of
-        # the samples passed). When using mixed precision, we add `pad_to_multiple_of=8` to pad all tensors to multiple
-        # of 8s, which will enable the use of Tensor Cores on NVIDIA hardware with compute capability >= 7.5 (Volta).
-        data_collator = DataCollatorWithPadding(
-            tokenizer, pad_to_multiple_of=(8 if accelerator.use_fp16 else None)
+        # Get the datasets: you can either provide your own CSV/JSON training and evaluation files (see below)
+        # or specify a GLUE benchmark task (the dataset will be downloaded automatically from the datasets Hub).
+
+        # For CSV/JSON files, this script will use as labels the column called 'label' and as pair of sentences the
+        # sentences in columns called 'sentence1' and 'sentence2' if such column exists or the first two columns not named
+        # label if at least two columns are provided.
+
+        # If the CSVs/JSONs contain only one non-label column, the script does single sentence classification on this
+        # single column. You can easily tweak this behavior (see below)
+
+        # In distributed training, the load_dataset function guarantee that only one local process can concurrently
+        # download the dataset.
+        # if args.task_name is not None:
+        #     # Downloading and loading a dataset from the hub.
+        #     raw_datasets = load_dataset("glue", args.task_name)
+        # else:
+        # Loading the dataset from local csv or json file.
+        data_files = {}
+        if args.train_file is not None:
+            data_files["train"] = args.train_file
+        if args.validation_file is not None:
+            data_files["validation"] = args.validation_file
+        if args.test_file is not None:
+            data_files["test"] = args.test_file
+        extension = (
+            args.train_file if args.train_file is not None else args.validation_file
+        ).split(".")[-1]
+        raw_datasets = load_dataset(extension, data_files=data_files)
+        # See more about loading any type of standard or custom dataset at
+        # https://huggingface.co/docs/datasets/loading_datasets.html.
+
+        # Trying to have good defaults here, don't hesitate to tweak to your needs.
+        # A useful fast method:
+        # https://huggingface.co/docs/datasets/package_reference/main_classes.html#datasets.Dataset.unique
+        label_list = raw_datasets["train"].unique("label")
+        label_list.sort()  # Let's sort it for determinism
+        num_labels = len(label_list)
+        label_to_id = {v: i for i, v in enumerate(label_list)}
+
+        # Load tokenizer and model
+        config = AutoConfig.from_pretrained(
+            args.model_name_or_path, num_labels=num_labels
+        )  # finetuning_task=args.task_name)
+        tokenizer = AutoTokenizer.from_pretrained(
+            args.model_name_or_path, use_fast=not args.use_slow_tokenizer
         )
-
-    padding = "max_length" if args.pad_to_max_length else False
-
-    def preprocess_function(examples):
-        # Tokenize the texts
-        texts = (examples["text"],)
-        result = tokenizer(
-            *texts, padding=padding, max_length=args.max_length, truncation=True
-        )
-
-        if "label" in examples:
-            if label_to_id is not None:
-                # Map labels to IDs (not necessary for GLUE tasks)
-                result["labels"] = [label_to_id[l] for l in examples["label"]]
-            else:
-                # In all cases, rename the column to labels because the model will expect that.
-                result["labels"] = examples["label"]
-        return result
-
-    with accelerator.main_process_first():
-        processed_datasets = raw_datasets.map(
-            preprocess_function,
-            batched=True,
-            remove_columns=raw_datasets["train"].column_names,
-            desc="Running tokenizer on dataset",
-        )
-
-    for fold, (train_ids, test_ids) in enumerate(
-        kfold.split(processed_datasets["train"])
-    ):
-
-        # Load pretrained model and tokenizer
-        #
-        # In distributed training, the .from_pretrained methods guarantee that only one local process can concurrently
-        # download model & vocab.
         if args.model == "stl":
             model = BERT_STL(
                 args.model_name_or_path,
@@ -429,18 +363,57 @@ def main():
                 id: label for label, id in config.label2id.items()
             }
 
-        train_dataset = processed_datasets["train"].select(train_ids)
-        train_eval_dataset = train_dataset.train_test_split(test_size=0.1)
-        test_dataset = processed_datasets["train"].select(test_ids)
+        padding = "max_length" if args.pad_to_max_length else False
+
+        def preprocess_function(examples):
+            # Tokenize the texts
+            texts = (examples["text"],)
+            result = tokenizer(
+                *texts, padding=padding, max_length=args.max_length, truncation=True
+            )
+
+            if "label" in examples:
+                if label_to_id is not None:
+                    # Map labels to IDs (not necessary for GLUE tasks)
+                    result["labels"] = [label_to_id[l] for l in examples["label"]]
+                else:
+                    # In all cases, rename the column to labels because the model will expect that.
+                    result["labels"] = examples["label"]
+            return result
+
+        with accelerator.main_process_first():
+            processed_datasets = raw_datasets.map(
+                preprocess_function,
+                batched=True,
+                remove_columns=raw_datasets["train"].column_names,
+                desc="Running tokenizer on dataset",
+            )
+
+        train_dataset = processed_datasets["train"]
+        eval_dataset = processed_datasets["validation"]
+        test_dataset = processed_datasets["test"]
+
+        # DataLoaders creation:
+        if args.pad_to_max_length:
+            # If padding was already done ot max length, we use the default data collator that will just convert everything
+            # to tensors.
+            data_collator = default_data_collator
+        else:
+            # Otherwise, `DataCollatorWithPadding` will apply dynamic padding for us (by padding to the maximum length of
+            # the samples passed). When using mixed precision, we add `pad_to_multiple_of=8` to pad all tensors to multiple
+            # of 8s, which will enable the use of Tensor Cores on NVIDIA hardware with compute capability >= 7.5 (Volta).
+            data_collator = DataCollatorWithPadding(
+                tokenizer, pad_to_multiple_of=(8 if accelerator.use_fp16 else None)
+            )
 
         train_dataloader = DataLoader(
-            train_eval_dataset["train"],
+            train_dataset,
             shuffle=True,
             collate_fn=data_collator,
             batch_size=args.per_device_train_batch_size,
         )
         eval_dataloader = DataLoader(
-            train_eval_dataset["test"],
+            eval_dataset,
             collate_fn=data_collator,
             batch_size=args.per_device_eval_batch_size,
         )
@@ -497,9 +470,15 @@ def main():
             optimizer,
             train_dataloader,
             eval_dataloader,
+            test_dataloader,
             lr_scheduler,
         ) = accelerator.prepare(
-            model, optimizer, train_dataloader, eval_dataloader, lr_scheduler
+            model,
+            optimizer,
+            train_dataloader,
+            eval_dataloader,
+            test_dataloader,
+            lr_scheduler,
         )
 
         # We need to recalculate our total training steps as the size of the training dataloader may have changed
@@ -535,19 +514,19 @@ def main():
         )
 
         logger.info("***** Running training *****")
-        # logger.info(f"  Fold = {fold}")
-        # logger.info(f"  Num examples = {len(sub_train_dataset)}")
-        # logger.info(f"  Num Epochs = {args.num_train_epochs}")
-        # logger.info(
-        #     f"  Instantaneous batch size per device = {args.per_device_train_batch_size}"
-        # )
-        # logger.info(
-        #     f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}"
-        # )
-        # logger.info(
-        #     f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}"
-        # )
-        # logger.info(f"  Total optimization steps = {args.max_train_steps}")
+        logger.info(f"  Seed = {seed}")
+        logger.info(f"  Num examples = {len(train_dataset)}")
+        logger.info(f"  Num Epochs = {args.num_train_epochs}")
+        logger.info(
+            f"  Instantaneous batch size per device = {args.per_device_train_batch_size}"
+        )
+        logger.info(
+            f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}"
+        )
+        logger.info(
+            f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}"
+        )
+        logger.info(f"  Total optimization steps = {args.max_train_steps}")
         # Only show the progress bar once on each machine.
         progress_bar = tqdm(
             range(args.max_train_steps), disable=not accelerator.is_local_main_process
@@ -637,11 +616,12 @@ def main():
             logger.info(f"epoch {epoch}: eval loss: {eval_loss}")
 
             if eval_loss < best_eval_loss:
+                logger.info("Saving best model")
                 best_eval_loss = eval_loss
                 best_model = copy.deepcopy(model)
 
         # evaluate best model on test data
-        best_model, test_dataloader = accelerator.prepare(best_model, test_dataloader)
+        # best_model = accelerator.prepare(best_model)
         best_model.eval()
         for step, batch in enumerate(test_dataloader):
             with torch.no_grad():
@@ -669,10 +649,10 @@ def main():
 
         # Print metric
         logger.info("--------------------------------")
-        logger.info(f"Eval metric for fold {fold}: {test_metric}")
+        logger.info(f"Eval metric for seed {seed}: {test_metric}")
         logger.info("--------------------------------")
 
-        results[fold] = test_metric
+        results[seed] = test_metric
 
         if args.output_dir is not None:
             accelerator.wait_for_everyone()
@@ -690,11 +670,11 @@ def main():
                 json.dump({"eval_f1": test_metric["f1"]}, f)
 
     # Print fold results
-    print(f"K-FOLD CROSS VALIDATION RESULTS FOR {k_folds} FOLDS")
+    print(f"RESULTS FOR {len(seeds)} SEEDS")
     print("--------------------------------")
     counter = collections.Counter()
     for key, result in results.items():
-        print(f"Fold {key}: {result} %")
+        print(f"Seed {key}: {result} %")
         counter.update(result)
     sum = dict(counter)
     print(f"Average: {({key: value / len(results) for key, value in sum.items()})} %")
