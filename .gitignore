@@ -136,6 +136,7 @@ notebooks/
 runs/
 wandb/
 params/
+ckpt/
 
 teacher_preds/
 

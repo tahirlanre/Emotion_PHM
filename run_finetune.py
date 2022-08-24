@@ -295,7 +295,7 @@ def main():
     logger.info(accelerator.state, main_process_only=False)
     if accelerator.is_local_main_process:
         datasets.utils.logging.set_verbosity_warning()
-        transformers.utils.logging.set_verbosity_info()
+        transformers.utils.logging.set_verbosity_warning()
     else:
         datasets.utils.logging.set_verbosity_error()
         transformers.utils.logging.set_verbosity_error()
@@ -620,6 +620,7 @@ def main():
             starting_epoch = resume_step // len(train_dataloader)
             resume_step -= starting_epoch * len(train_dataloader)
 
+    best_eval_loss = float("inf")
     for epoch in range(starting_epoch, args.num_train_epochs):
         model.train()
         if args.with_tracking:
@@ -661,6 +662,7 @@ def main():
         references = None
 
         model.eval()
+        eval_loss = 0.0
         for step, batch in enumerate(eval_dataloader):
             with torch.no_grad():
                 outputs = model(**batch)
@@ -678,7 +680,6 @@ def main():
                     references = np.append(
                         references, batch["labels"].detach().cpu().numpy()
                     )
-
             else:
                 if predictions is None:
                     predictions = outputs.logits.argmax(dim=-1).detach().cpu().numpy()
@@ -691,7 +692,9 @@ def main():
                     references = np.append(
                         references, batch["labels"].detach().cpu().numpy()
                     )
+            eval_loss += outputs[0].item()
 
+        eval_loss - eval_loss / len(eval_dataloader)
         if train_is_multilabel:
             predictions[predictions > args.threshold] = 1
             predictions[predictions <= args.threshold] = 0
@@ -714,44 +717,23 @@ def main():
                 step=completed_steps,
             )
 
-        if args.push_to_hub and epoch < args.num_train_epochs - 1:
-            accelerator.wait_for_everyone()
-            unwrapped_model = accelerator.unwrap_model(model)
-            unwrapped_model.save_pretrained(
-                args.output_dir,
-                is_main_process=accelerator.is_main_process,
-                save_function=accelerator.save,
-            )
-            if accelerator.is_main_process:
-                tokenizer.save_pretrained(args.output_dir)
-                repo.push_to_hub(
-                    commit_message=f"Training in progress epoch {epoch}",
-                    blocking=False,
-                    auto_lfs_prune=True,
-                )
-
-        if args.checkpointing_steps == "epoch":
-            output_dir = f"epoch_{epoch}"
+        if eval_loss < best_eval_loss:
+            best_eval_loss = eval_loss
             if args.output_dir is not None:
-                output_dir = os.path.join(args.output_dir, output_dir)
-            accelerator.save_state(output_dir)
+                logging.info("Saving best model")
+                accelerator.wait_for_everyone()
+                unwrapped_model = accelerator.unwrap_model(model)
+                unwrapped_model.save_pretrained(
+                    args.output_dir,
+                    is_main_process=accelerator.is_main_process,
+                    save_function=accelerator.save,
+                )
+                with open(os.path.join(args.output_dir, "all_results.json"), "w") as f:
+                    json.dump({"eval_f1": eval_metric["f1"]}, f)
 
     if args.output_dir is not None:
-        accelerator.wait_for_everyone()
-        unwrapped_model = accelerator.unwrap_model(model)
-        unwrapped_model.save_pretrained(
-            args.output_dir,
-            is_main_process=accelerator.is_main_process,
-            save_function=accelerator.save,
-        )
         if accelerator.is_main_process:
             tokenizer.save_pretrained(args.output_dir)
-            if args.push_to_hub:
-                repo.push_to_hub(commit_message="End of training", auto_lfs_prune=True)
-
-    if args.output_dir is not None:
-        with open(os.path.join(args.output_dir, "all_results.json"), "w") as f:
-            json.dump({"eval_f1": eval_metric["f1"]}, f)
 
 
 if __name__ == "__main__":
