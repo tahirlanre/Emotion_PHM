@@ -3,6 +3,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoModel
 
+from sklearn.metrics.pairwise import cosine_similarity
+import numpy as np
+
 
 class MultiheadAttention_test(nn.Module):
     # n_heads：number of heads
@@ -208,6 +211,78 @@ class BERT_STL(nn.Module):
             loss_fn = nn.CrossEntropyLoss()
             loss = loss_fn(logits, labels)
 
+        output = (logits,)
+
+        return ((loss,) + output) if loss is not None else output
+
+
+class BERT_SCL(nn.Module):
+    def __init__(
+        self, enc_model_name_or_path, num_labels, dropout=0.2, temperature=0.3, lam=0.9
+    ) -> None:
+        super().__init__()
+
+        self.enc_model = AutoModel.from_pretrained(enc_model_name_or_path)
+        self.num_labels = num_labels
+        self.temperature = temperature
+        self.lam = lam
+
+        self.classifier = nn.Linear(768, num_labels)
+
+        self.dropout = nn.Dropout(dropout)
+
+    def contrastive_loss(self, temp, embedding, label):
+        """calculate the contrastive loss"""
+        # cosine similarity between embeddings
+        cosine_sim = cosine_similarity(embedding, embedding)
+        # remove diagonal elements from matrix
+        dis = cosine_sim[~np.eye(cosine_sim.shape[0], dtype=bool)].reshape(
+            cosine_sim.shape[0], -1
+        )
+        # apply temprature to elements
+        dis = dis / temp
+        cosine_sim = cosine_sim / temp
+        # apply exp to elements
+        dis = np.exp(dis)
+        cosine_sim = np.exp(cosine_sim)
+
+        # calculate row sum
+        row_sum = []
+        for i in range(len(embedding)):
+            row_sum.append(sum(dis[i]))
+        # calculate outer sum
+        contrastive_loss = 0
+        for i in range(len(embedding)):
+            n_i = label.tolist().count(label[i]) - 1
+            inner_sum = 0
+            # calculate inner sum
+            for j in range(len(embedding)):
+                if label[i] == label[j] and i != j:
+                    inner_sum = inner_sum + np.log(cosine_sim[i][j] / row_sum[i])
+            if n_i != 0:
+                contrastive_loss += inner_sum / (-n_i)
+            else:
+                contrastive_loss += 0
+        return contrastive_loss
+
+    def forward(self, input_ids, attention_mask=None, token_type_ids=None, labels=None):
+        outputs = self.enc_model(input_ids, attention_mask=attention_mask)
+
+        last_hidden_state_cls = outputs[0][:, 0, :]
+        pooled_output = outputs[1]
+
+        pooled_output = self.dropout(pooled_output)
+        logits = self.classifier(pooled_output)
+
+        loss = None
+        if labels is not None:
+            loss_fn = nn.CrossEntropyLoss()
+            cross_loss = loss_fn(logits, labels)
+
+            contrastive_l = self.contrastive_loss(
+                self.temperature, last_hidden_state_cls.cpu().detach().numpy(), labels
+            )
+            loss = (self.lam * contrastive_l) + (1 - self.lam) * (cross_loss)
         output = (logits,)
 
         return ((loss,) + output) if loss is not None else output
