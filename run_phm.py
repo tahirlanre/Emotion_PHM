@@ -93,21 +93,21 @@ def parse_args():
         help="If passed, pad all samples to `max_length`. Otherwise, dynamic padding is used.",
     )
     parser.add_argument(
-        "--model_name_or_path",
+        "--bert_model",
         type=str,
         help="Path to pretrained model or model identifier from huggingface.co/models.",
         required=True,
     )
     parser.add_argument(
-        "--emotion_model_name_or_path",
+        "--emotion_model",
         type=str,
         help="Path to pretrained model on emotion representatons.",
         # required=True,
     )
     parser.add_argument(
-        "--model",
+        "--model_type",
         type=str,
-        choices=["mtl", "mtl_attn", "stl", "mtl_max", "scl"],
+        choices=["multi_feature", "base"],
         required=True,
         help="the name of the model to use. some models may use different model args than others.",
     )
@@ -213,9 +213,6 @@ def parse_args():
     args = parser.parse_args()
 
     # Sanity checks
-    # if args.task_name is None and args.train_file is None and args.validation_file is None:
-    #     raise ValueError("Need either a task name or a training/validation file.")
-    # else:
     if args.train_file is not None:
         extension = args.train_file.split(".")[-1]
         assert extension in [
@@ -235,9 +232,8 @@ def parse_args():
             "json",
         ], "`test_file` should be a csv or a json file."
 
-    if args.model == "mtl" or args.model == "mtl_attn" or args.model == "mtl_max":
-        if args.emotion_model_name_or_path is None:
-            raise ValueError("Need an emotion pre-trained model")
+    if args.model_type == "multi_feature" and args.emotion_model is None:
+        raise ValueError("Need an emotion pre-trained model")
 
     return args
 
@@ -280,27 +276,8 @@ def main():
         set_seed(seed)
 
         accelerator.wait_for_everyone()
-        # set up wandb to track metrics
-        # wandb.login()
-        # wandb.init(project="phm-classification", config=args)
 
-        # Get the datasets: you can either provide your own CSV/JSON training and evaluation files (see below)
-        # or specify a GLUE benchmark task (the dataset will be downloaded automatically from the datasets Hub).
-
-        # For CSV/JSON files, this script will use as labels the column called 'label' and as pair of sentences the
-        # sentences in columns called 'sentence1' and 'sentence2' if such column exists or the first two columns not named
-        # label if at least two columns are provided.
-
-        # If the CSVs/JSONs contain only one non-label column, the script does single sentence classification on this
-        # single column. You can easily tweak this behavior (see below)
-
-        # In distributed training, the load_dataset function guarantee that only one local process can concurrently
-        # download the dataset.
-        # if args.task_name is not None:
-        #     # Downloading and loading a dataset from the hub.
-        #     raw_datasets = load_dataset("glue", args.task_name)
-        # else:
-        # Loading the dataset from local csv or json file.
+        # Loading the dataset from local csv  file.
         data_files = {}
         if args.train_file is not None:
             data_files["train"] = args.train_file
@@ -324,40 +301,19 @@ def main():
         label_to_id = {v: i for i, v in enumerate(label_list)}
 
         # Load tokenizer and model
-        config = AutoConfig.from_pretrained(
-            args.model_name_or_path, num_labels=num_labels
-        )  # finetuning_task=args.task_name)
+        config = AutoConfig.from_pretrained(args.bert_model, num_labels=num_labels)
         tokenizer = AutoTokenizer.from_pretrained(
-            args.model_name_or_path, use_fast=not args.use_slow_tokenizer
+            args.bert_model, use_fast=not args.use_slow_tokenizer
         )
-        if args.model == "stl":
+        if args.model_type == "base":
             model = BERT_STL(
-                args.model_name_or_path,
+                args.bert_model,
                 num_labels,
-                # args.dropout,
             )
-        elif args.model == "mtl":
+        elif args.model_type == "multi_feature":
             model = BERT_MTL(
-                args.model_name_or_path,
-                args.emotion_model_name_or_path,
-                num_labels,
-                # args.dropout,
-            )
-        elif args.model == "mtl_attn":
-            model = BERT_MTL_ATTN(
-                args.model_name_or_path,
-                args.emotion_model_name_or_path,
-                num_labels,
-            )
-        elif args.model == "mtl_max":
-            model = BERT_MTL_MAX(
-                args.model_name_or_path,
-                args.emotion_model_name_or_path,
-                num_labels,
-            )
-        elif args.model == "scl":
-            model = BERT_SCL(
-                args.model_name_or_path,
+                args.bert_model,
+                args.emotion_model,
                 num_labels,
             )
 
@@ -506,9 +462,6 @@ def main():
             checkpointing_steps = None
 
         # Get the metric function
-        # if args.task_name is not None:
-        #     metric = evaluate.load("glue", args.task_name)
-        # else:
         metric = evaluate.load("f1")
 
         # Train!
@@ -626,7 +579,6 @@ def main():
                 best_model = copy.deepcopy(model)
 
         # evaluate best model on test data
-        # best_model = accelerator.prepare(best_model)
         best_model.eval()
         for step, batch in enumerate(test_dataloader):
             with torch.no_grad():

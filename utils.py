@@ -57,43 +57,12 @@ def log_step(func):
     return wrapper
 
 
-def save_to_disk(dataf, path):
-    dataf.to_csv(path, index=False)
-
-
 def set_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-
-
-# def compute_metrics(labels, preds):
-#     assert len(preds) == len(labels)
-#     results = dict()
-
-#     results["accuracy"] = accuracy_score(labels, preds)
-#     (
-#         results["macro_precision"],
-#         results["macro_recall"],
-#         results["macro_f1"],
-#         _,
-#     ) = precision_recall_fscore_support(labels, preds, average="macro")
-#     (
-#         results["micro_precision"],
-#         results["micro_recall"],
-#         results["micro_f1"],
-#         _,
-#     ) = precision_recall_fscore_support(labels, preds, average="micro")
-#     (
-#         results["weighted_precision"],
-#         results["weighted_recall"],
-#         results["weighted_f1"],
-#         _,
-#     ) = precision_recall_fscore_support(labels, preds, average="weighted")
-
-#     return results
 
 
 def save_checkpoint(model_to_save, tokenizer, global_step, output_dir):
