@@ -115,7 +115,7 @@ def parse_args():
         help="If passed, pad all samples to `max_length`. Otherwise, dynamic padding is used.",
     )
     parser.add_argument(
-        "--model_name_or_path",
+        "--bert_model",
         type=str,
         help="Path to pretrained model or model identifier from huggingface.co/models.",
         required=True,
@@ -358,7 +358,7 @@ def main():
     # https://huggingface.co/docs/datasets/package_reference/main_classes.html#datasets.Dataset.unique
 
     # handle multilabel case
-    train_is_multilabel = any("," in label for label in raw_datasets["train"]["label"])
+    train_is_multilabel = any("," in str(label) for label in raw_datasets["train"]["label"])
 
     if train_is_multilabel:
         num_labels = len(raw_datasets["train"]["label"][0].split(","))
@@ -373,21 +373,21 @@ def main():
     # download model & vocab.
     if train_is_multilabel:
         config = AutoConfig.from_pretrained(
-            args.model_name_or_path,
+            args.bert_model,
             num_labels=num_labels,
             problem_type="multi_label_classification",
         )
     else:
         config = AutoConfig.from_pretrained(
-            args.model_name_or_path, num_labels=num_labels
+            args.bert_model, num_labels=num_labels
         )
 
     tokenizer = AutoTokenizer.from_pretrained(
-        args.model_name_or_path, use_fast=not args.use_slow_tokenizer
+        args.bert_model, use_fast=not args.use_slow_tokenizer
     )
     model = AutoModelForSequenceClassification.from_pretrained(
-        args.model_name_or_path,
-        from_tf=bool(".ckpt" in args.model_name_or_path),
+        args.bert_model,
+        from_tf=bool(".ckpt" in args.bert_model),
         config=config,
         ignore_mismatched_sizes=args.ignore_mismatched_sizes,
     )
@@ -425,11 +425,7 @@ def main():
 
     def preprocess_function(examples):
         # Tokenize the texts
-        texts = (
-            (examples[sentence1_key],)
-            if sentence2_key is None
-            else (examples[sentence1_key], examples[sentence2_key])
-        )
+        texts = (examples["text"],)
         result = tokenizer(
             *texts, padding=padding, max_length=args.max_length, truncation=True
         )
